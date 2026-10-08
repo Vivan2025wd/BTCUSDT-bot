@@ -1,0 +1,76 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Privacy Trading Bot - Local Control</title>
+    <style>
+        body {
+            margin: 0;
+            padding: 0;
+            font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', 'Roboto', 'Oxygen',
+                'Ubuntu', 'Cantarell', 'Fira Sans', 'Droid Sans', 'Helvetica Neue',
+                sans-serif;
+            -webkit-font-smoothing: antialiased;
+            -moz-osx-font-smoothing: grayscale;
+            background-color: #1a1a1a;
+            color: #ffffff;
+            overflow: hidden;
+        }
+        
+        #root {
+            width: 100vw;
+            height: 100vh;
+            overflow: hidden;
+        }
+        
+        /* Loading spinner */
+        .loading-spinner {
+            display: flex;
+            justify-content: center;
+            align-items: center;
+            height: 100vh;
+            flex-direction: column;
+        }
+        
+        .spinner {
+            border: 4px solid #2a2a2a;
+            border-top: 4px solid #00d4aa;
+            border-radius: 50%;
+            width: 40px;
+            height: 40px;
+            animation: spin 1s linear infinite;
+            margin-bottom: 20px;
+        }
+        
+        @keyframes spin {
+            0% { transform: rotate(0deg); }
+            100% { transform: rotate(360deg); }
+        }
+        
+        .loading-text {
+            color: #888;
+            font-size: 14px;
+        }
+    </style>
+</head>
+<body>
+    <noscript>You need to enable JavaScript to run this app.</noscript>
+    <div id="root">
+        <div class="loading-spinner">
+            <div class="spinner"></div>
+            <div class="loading-text">Loading Privacy Trading Bot...</div>
+        </div>
+    </div>
+    
+    <script>
+        // Global error handler for debugging
+        window.addEventListener('error', function(e) {
+            console.error('Global error:', e.error);
+        });
+        
+        // Log when React starts loading
+        console.log('HTML loaded, waiting for React...');
+    </script>
+</body>
+</html>
