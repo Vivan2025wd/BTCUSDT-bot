@@ -1,67 +1,101 @@
+'use strict';
+
 class PositionSizer {
   constructor(config = {}) {
-    this.defaultRiskPercent = config.defaultRiskPercent || 2; // 2% of account
-    this.maxRiskPercent = config.maxRiskPercent || 5; // Max 5% per trade
-    this.maxPositionPercent = config.maxPositionPercent || 10; // Max 10% of account per position
-    this.minTradeAmount = config.minTradeAmount || 10; // Minimum $10 trade
-    this.maxPositions = config.maxPositions || 5; // Max concurrent positions
+    // Accept BOTH naming conventions:
+    //   - positionSizePercent (from TradingBot config.riskSettings)
+    //   - defaultRiskPercent  (internal historical name)
+    this.defaultRiskPercent  = config.positionSizePercent ?? config.defaultRiskPercent ?? 2;
+    this.maxRiskPercent      = config.maxRiskPercent ?? 5;
+    this.maxPositionPercent  = config.maxPositionPercent ?? 10;
+    this.minTradeAmount      = config.minTradeAmount ?? 10;
+    this.maxPositions        = config.maxPositions ?? 5;
+
+    // Default stop-loss percentage used if caller doesn't pass one
+    this.defaultStopLossPercent = config.stopLossPercent ?? 3;
   }
 
-  // Calculate position size based on fixed percentage risk
+  /** Called by TradingBot.updateConfig() */
+  updateSettings(newConfig = {}) {
+    if (newConfig.positionSizePercent != null) this.defaultRiskPercent = newConfig.positionSizePercent;
+    if (newConfig.maxRiskPercent != null)      this.maxRiskPercent = newConfig.maxRiskPercent;
+    if (newConfig.maxPositionPercent != null)  this.maxPositionPercent = newConfig.maxPositionPercent;
+    if (newConfig.minTradeAmount != null)      this.minTradeAmount = newConfig.minTradeAmount;
+    if (newConfig.maxPositions != null)        this.maxPositions = newConfig.maxPositions;
+    if (newConfig.stopLossPercent != null)     this.defaultStopLossPercent = newConfig.stopLossPercent;
+  }
+
+  /**
+   * Simple entry-point used by TradingBot.executeBuyOrder():
+   *   const positionValue = sizer.calculateSize(balance, price);
+   * Returns the USDT notional (not quantity).
+   */
+  calculateSize(accountBalance, currentPrice, stopLossPercent = null) {
+    const result = this.calculateFixedPercentRisk(
+      accountBalance,
+      this.defaultRiskPercent,
+      stopLossPercent ?? this.defaultStopLossPercent,
+      currentPrice
+    );
+    return result.isValid ? result.positionValue : 0;
+  }
+
+  /* ═══════════════════════════════════════════════════════════════
+     CORE METHODS
+     ═══════════════════════════════════════════════════════════════ */
+
   calculateFixedPercentRisk(accountBalance, riskPercent, stopLossPercent, currentPrice) {
-    if (!accountBalance || !stopLossPercent || !currentPrice) {
-      throw new Error('Missing required parameters for position sizing');
+    if (!accountBalance || accountBalance <= 0) {
+      return this._invalid('invalid_balance');
+    }
+    if (!stopLossPercent || stopLossPercent <= 0) {
+      return this._invalid('invalid_stop_loss');
+    }
+    if (!currentPrice || currentPrice <= 0) {
+      return this._invalid('invalid_price');
     }
 
-    // Validate risk percentage
     const risk = Math.min(riskPercent || this.defaultRiskPercent, this.maxRiskPercent);
-    
-    // Calculate risk amount in dollars
     const riskAmount = accountBalance * (risk / 100);
-    
-    // Calculate position size based on stop loss
-    const stopLossAmount = stopLossPercent / 100;
-    const positionValue = riskAmount / stopLossAmount;
-    
-    // Calculate quantity
-    const quantity = positionValue / currentPrice;
-    
-    // Apply maximum position size limit
+
+    // positionValue = riskAmount / (stopLossPercent / 100)
+    const stopLossFraction = stopLossPercent / 100;
+    let positionValue = riskAmount / stopLossFraction;
+
+    // Clamp to max position size
     const maxPositionValue = accountBalance * (this.maxPositionPercent / 100);
-    const maxQuantity = maxPositionValue / currentPrice;
-    
-    const finalQuantity = Math.min(quantity, maxQuantity);
-    const finalPositionValue = finalQuantity * currentPrice;
+    positionValue = Math.min(positionValue, maxPositionValue);
+
+    const quantity = positionValue / currentPrice;
 
     return {
-      quantity: finalQuantity,
-      positionValue: finalPositionValue,
+      quantity,
+      positionValue,
       riskAmount,
       riskPercent: risk,
       stopLossPercent,
-      isValid: finalPositionValue >= this.minTradeAmount
+      isValid: positionValue >= this.minTradeAmount
     };
   }
 
-  // Calculate position size using Kelly Criterion
   calculateKellySize(accountBalance, winRate, avgWin, avgLoss, currentPrice, maxRisk = 0.25) {
+    // Kelly assumes: winRate ∈ (0,1), avgWin > 0, avgLoss < 0
+    // (avgLoss is the *signed* average loss — negative number.)
     if (winRate <= 0 || winRate >= 1 || avgWin <= 0 || avgLoss >= 0) {
-      // Fall back to fixed percent if Kelly inputs are invalid
-      return this.calculateFixedPercentRisk(accountBalance, this.defaultRiskPercent, 3, currentPrice);
+      return this.calculateFixedPercentRisk(
+        accountBalance,
+        this.defaultRiskPercent,
+        this.defaultStopLossPercent,
+        currentPrice
+      );
     }
 
-    // Kelly formula: f = (bp - q) / b
-    // where: b = avgWin/|avgLoss|, p = winRate, q = lossRate
     const b = avgWin / Math.abs(avgLoss);
     const p = winRate;
     const q = 1 - winRate;
-    
-    const kellyPercent = (b * p - q) / b;
-    
-    // Cap Kelly percentage to avoid over-leveraging
-    const cappedKelly = Math.max(0, Math.min(kellyPercent, maxRisk));
-    
-    // Convert to position size
+    const kelly = (b * p - q) / b;
+
+    const cappedKelly = Math.max(0, Math.min(kelly, maxRisk));
     const positionValue = accountBalance * cappedKelly;
     const quantity = positionValue / currentPrice;
 
@@ -73,73 +107,52 @@ class PositionSizer {
     };
   }
 
-  // Calculate position size based on volatility (ATR)
   calculateVolatilityBasedSize(accountBalance, atr, currentPrice, multiplier = 2) {
     if (!atr || atr <= 0) {
-      throw new Error('Invalid ATR value for volatility-based sizing');
+      return this._invalid('invalid_atr');
     }
-
-    // Use ATR as a proxy for stop loss distance
-    const stopLossDistance = atr * multiplier;
-    const stopLossPercent = (stopLossDistance / currentPrice) * 100;
-    
+    const stopDistance = atr * multiplier;
+    const stopLossPercent = (stopDistance / currentPrice) * 100;
     return this.calculateFixedPercentRisk(
-      accountBalance, 
-      this.defaultRiskPercent, 
-      stopLossPercent, 
+      accountBalance,
+      this.defaultRiskPercent,
+      stopLossPercent,
       currentPrice
     );
   }
 
-  // Portfolio-aware position sizing
   calculatePortfolioAwareSize(accountBalance, currentPositions, symbol, riskPercent, stopLossPercent, currentPrice) {
-    // Check if we're at max positions
     if (currentPositions.length >= this.maxPositions) {
-      return {
-        quantity: 0,
-        positionValue: 0,
-        isValid: false,
-        reason: 'max_positions_reached'
-      };
+      return this._invalid('max_positions_reached');
     }
 
-    // Calculate current portfolio exposure
-    const totalExposure = currentPositions.reduce((sum, pos) => sum + pos.positionValue, 0);
-    const exposurePercent = (totalExposure / accountBalance) * 100;
+    const totalExposure = currentPositions.reduce((s, p) => s + (p.positionValue || 0), 0);
+    const exposurePercent = accountBalance > 0 ? (totalExposure / accountBalance) * 100 : 0;
 
-    // Reduce position size if portfolio is heavily exposed
-    let adjustedRisk = riskPercent;
-    if (exposurePercent > 30) { // If more than 30% of account is in positions
-      adjustedRisk *= 0.7; // Reduce new position size by 30%
-    }
-    if (exposurePercent > 50) {
-      adjustedRisk *= 0.5; // Further reduce if over 50%
-    }
+    let adjustedRisk = riskPercent ?? this.defaultRiskPercent;
+    if (exposurePercent > 30) adjustedRisk *= 0.7;
+    if (exposurePercent > 50) adjustedRisk *= 0.5;
 
-    // Check if we already have a position in this symbol
-    const existingPosition = currentPositions.find(pos => pos.symbol === symbol);
-    if (existingPosition) {
-      // Reduce size for adding to existing position
+    if (currentPositions.some((p) => p.symbol === symbol)) {
       adjustedRisk *= 0.5;
     }
 
     return this.calculateFixedPercentRisk(
-      accountBalance, 
-      adjustedRisk, 
-      stopLossPercent, 
+      accountBalance,
+      adjustedRisk,
+      stopLossPercent,
       currentPrice
     );
   }
 
-  // Calculate optimal position size considering multiple factors
-  calculateOptimalSize(params) {
+  calculateOptimalSize(params = {}) {
     const {
       accountBalance,
       currentPositions = [],
-      symbol,
+      symbol = '',
       currentPrice,
-      stopLossPercent,
-      riskPercent,
+      stopLossPercent = this.defaultStopLossPercent,
+      riskPercent = this.defaultRiskPercent,
       winRate = null,
       avgWin = null,
       avgLoss = null,
@@ -148,80 +161,66 @@ class PositionSizer {
     } = params;
 
     let result;
-
     switch (method) {
       case 'kelly':
-        if (winRate && avgWin && avgLoss) {
-          result = this.calculateKellySize(accountBalance, winRate, avgWin, avgLoss, currentPrice);
-        } else {
-          result = this.calculateFixedPercentRisk(accountBalance, riskPercent, stopLossPercent, currentPrice);
-        }
+        result = (winRate && avgWin && avgLoss)
+          ? this.calculateKellySize(accountBalance, winRate, avgWin, avgLoss, currentPrice)
+          : this.calculateFixedPercentRisk(accountBalance, riskPercent, stopLossPercent, currentPrice);
         break;
-
       case 'volatility':
-        if (atr) {
-          result = this.calculateVolatilityBasedSize(accountBalance, atr, currentPrice);
-        } else {
-          result = this.calculateFixedPercentRisk(accountBalance, riskPercent, stopLossPercent, currentPrice);
-        }
+        result = atr
+          ? this.calculateVolatilityBasedSize(accountBalance, atr, currentPrice)
+          : this.calculateFixedPercentRisk(accountBalance, riskPercent, stopLossPercent, currentPrice);
         break;
-
       case 'portfolio_aware':
         result = this.calculatePortfolioAwareSize(
-          accountBalance, currentPositions, symbol, riskPercent, stopLossPercent, currentPrice
+          accountBalance, currentPositions, symbol,
+          riskPercent, stopLossPercent, currentPrice
         );
         break;
-
       case 'fixed_percent':
       default:
         result = this.calculateFixedPercentRisk(accountBalance, riskPercent, stopLossPercent, currentPrice);
-        break;
     }
 
-    // Add metadata
     result.method = method;
-    result.timestamp = new Date();
     result.symbol = symbol;
-
+    result.timestamp = new Date();
     return result;
   }
 
-  // Validate position size before execution
   validatePositionSize(positionSize, accountBalance, currentPositions = []) {
     const warnings = [];
     const errors = [];
 
-    // Check minimum trade amount
     if (positionSize.positionValue < this.minTradeAmount) {
-      errors.push(`Position value ${positionSize.positionValue.toFixed(2)} is below minimum ${this.minTradeAmount}`);
+      errors.push(`Position $${positionSize.positionValue.toFixed(2)} below minimum $${this.minTradeAmount}`);
     }
 
-    // Check if position is too large relative to account
     const positionPercent = (positionSize.positionValue / accountBalance) * 100;
     if (positionPercent > this.maxPositionPercent) {
-      errors.push(`Position size ${positionPercent.toFixed(1)}% exceeds maximum ${this.maxPositionPercent}%`);
+      errors.push(`Position ${positionPercent.toFixed(1)}% exceeds max ${this.maxPositionPercent}%`);
     }
 
-    // Check portfolio exposure
-    const currentExposure = currentPositions.reduce((sum, pos) => sum + pos.positionValue, 0);
-    const newTotalExposure = currentExposure + positionSize.positionValue;
-    const totalExposurePercent = (newTotalExposure / accountBalance) * 100;
+    const currentExposure = currentPositions.reduce((s, p) => s + (p.positionValue || 0), 0);
+    const totalExposure = currentExposure + positionSize.positionValue;
+    const totalExposurePercent = (totalExposure / accountBalance) * 100;
 
     if (totalExposurePercent > 70) {
-      warnings.push(`Total portfolio exposure would be ${totalExposurePercent.toFixed(1)}%`);
+      warnings.push(`Portfolio exposure would be ${totalExposurePercent.toFixed(1)}%`);
     }
 
-    // Check available balance
-    const availableBalance = accountBalance - currentExposure;
-    if (positionSize.positionValue > availableBalance) {
-      errors.push(`Insufficient available balance: need ${positionSize.positionValue.toFixed(2)}, have ${availableBalance.toFixed(2)}`);
+    const available = accountBalance - currentExposure;
+    if (positionSize.positionValue > available) {
+      errors.push(`Insufficient balance: need $${positionSize.positionValue.toFixed(2)}, have $${available.toFixed(2)}`);
     }
 
-    return {
-      isValid: errors.length === 0,
-      errors,
-      warnings
-    };
+    return { isValid: errors.length === 0, errors, warnings };
+  }
+
+  /* ─── internal ─── */
+  _invalid(reason) {
+    return { quantity: 0, positionValue: 0, isValid: false, reason };
   }
 }
 

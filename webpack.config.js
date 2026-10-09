@@ -1,4 +1,5 @@
 const path = require('path');
+const webpack = require('webpack');
 const HtmlWebpackPlugin = require('html-webpack-plugin');
 const CopyWebpackPlugin = require('copy-webpack-plugin');
 
@@ -7,17 +8,24 @@ module.exports = (env, argv) => {
 
   return {
     entry: './src/renderer/index.js',
-    target: 'electron-renderer',
-    
+    target: 'web',
+
     output: {
       path: path.resolve(__dirname, 'build'),
       filename: isDev ? '[name].js' : '[name].[contenthash].js',
       publicPath: isDev ? '/' : './',
-      clean: true
+      clean: true,
+      globalObject: 'window'
     },
 
     module: {
       rules: [
+        {
+          test: /\.m?js$/,
+          resolve: {
+            fullySpecified: false
+          }
+        },
         {
           test: /\.(js|jsx)$/,
           exclude: /node_modules/,
@@ -41,7 +49,7 @@ module.exports = (env, argv) => {
           type: 'asset',
           parser: {
             dataUrlCondition: {
-              maxSize: 8 * 1024 // 8KB
+              maxSize: 8 * 1024
             }
           }
         },
@@ -53,7 +61,7 @@ module.exports = (env, argv) => {
     },
 
     resolve: {
-      extensions: ['.js', '.jsx', '.json'],
+      extensions: ['.js', '.jsx', '.mjs', '.json'],
       alias: {
         '@': path.resolve(__dirname, 'src'),
         '@components': path.resolve(__dirname, 'src/renderer/components'),
@@ -61,50 +69,73 @@ module.exports = (env, argv) => {
         '@utils': path.resolve(__dirname, 'src/renderer/utils'),
         '@core': path.resolve(__dirname, 'src/core'),
         '@services': path.resolve(__dirname, 'src/services')
+      },
+      fallback: {
+        // ✅ FIX: webpack HMR emitter does `require('events')`.
+        // With target:'web' there's no Node runtime to satisfy that,
+        // so webpack must bundle the browser events shim.
+        events: require.resolve('events/'),
+        process: require.resolve('process/browser.js'),
+        buffer: require.resolve('buffer/')
       }
     },
 
     plugins: [
-  new HtmlWebpackPlugin({
-    template: './public/index.html',
-    filename: 'index.html',
-    inject: true,
-    minify: !isDev ? {
-      removeComments: true,
-      collapseWhitespace: true,
-      removeRedundantAttributes: true,
-      useShortDoctype: true,
-      removeEmptyAttributes: true,
-      removeStyleLinkTypeAttributes: true,
-      keepClosingSlash: true,
-      minifyJS: true,
-      minifyCSS: true,
-      minifyURLs: true
-    } : false
-  }),
+      new HtmlWebpackPlugin({
+        template: './public/index.html',
+        filename: 'index.html',
+        inject: true,
+        minify: !isDev ? {
+          removeComments: true,
+          collapseWhitespace: true,
+          removeRedundantAttributes: true,
+          useShortDoctype: true,
+          removeEmptyAttributes: true,
+          removeStyleLinkTypeAttributes: true,
+          keepClosingSlash: true,
+          minifyJS: true,
+          minifyCSS: true,
+          minifyURLs: true
+        } : false
+      }),
 
-  // Add this ProvidePlugin to polyfill global & process
-  new webpack.ProvidePlugin({
-    process: 'process/browser',
-    Buffer: ['buffer', 'Buffer'],
-  }),
+      new webpack.DefinePlugin({
+        global: 'window'
+      }),
 
-  new CopyWebpackPlugin({
-    patterns: [
-      {
-        from: path.resolve(__dirname, 'public'),
-        to: path.resolve(__dirname, 'build'),
-        globOptions: {
-          ignore: ['**/index.html']
-        }
-      },
-      {
-        from: path.resolve(__dirname, 'src/main'),
-        to: path.resolve(__dirname, 'build/main')
-      }
-    ]
-  }),
-],
+      new webpack.ProvidePlugin({
+        process: 'process/browser',
+        Buffer: ['buffer', 'Buffer']
+      }),
+
+      new CopyWebpackPlugin({
+        patterns: [
+          {
+            from: path.resolve(__dirname, 'public'),
+            to: path.resolve(__dirname, 'build'),
+            globOptions: {
+              ignore: ['**/index.html']
+            }
+          },
+          {
+            from: path.resolve(__dirname, 'src/main'),
+            to: path.resolve(__dirname, 'build/main')
+          },
+          {
+            from: path.resolve(__dirname, 'src/core'),
+            to: path.resolve(__dirname, 'build/core')
+          },
+          {
+            from: path.resolve(__dirname, 'src/database'),
+            to: path.resolve(__dirname, 'build/database')
+          },
+          {
+            from: path.resolve(__dirname, 'src/services'),
+            to: path.resolve(__dirname, 'build/services')
+          }
+        ]
+      })
+    ],
 
     devServer: {
       static: {
@@ -150,8 +181,12 @@ module.exports = (env, argv) => {
       }
     },
 
+    // ⚠️ NOTE: `crypto` is listed here. If the renderer ever imports
+    // `src/renderer/utils/encryption.js`, this will break with
+    // "require is not defined". It's fine for now because nothing
+    // in the renderer imports it yet. When you do, remove `crypto`
+    // from this block and add a browser crypto polyfill instead.
     externals: {
-      // Don't bundle these Node.js modules
       'sqlite3': 'commonjs sqlite3',
       'ws': 'commonjs ws',
       'crypto': 'commonjs crypto'

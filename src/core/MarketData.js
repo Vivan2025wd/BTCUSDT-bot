@@ -1,466 +1,595 @@
+// src/core/MarketData.js
+'use strict';
+
 const EventEmitter = require('events');
+const WebSocket = require('ws');
+
+/* ═══════════════════════════════════════════════════════════════
+   EXCHANGE ADAPTERS
+   Each adapter knows how to:
+     - fetch historical klines (REST)
+     - build a WebSocket URL
+     - subscribe to kline streams
+     - parse incoming messages
+   ═══════════════════════════════════════════════════════════════ */
+
+const ADAPTERS = {
+  binance: {
+    name: 'binance',
+
+    restUrl: (testnet) =>
+      testnet ? 'https://testnet.binance.vision' : 'https://api.binance.com',
+
+    wsUrl: (testnet) =>
+      testnet
+        ? 'wss://stream.testnet.binance.vision'
+        : 'wss://stream.binance.com:9443',
+
+    async fetchKlines({ symbol, interval, limit, testnet }) {
+      const base = this.restUrl(testnet);
+      const url = `${base}/api/v3/klines?symbol=${symbol}&interval=${interval}&limit=${Math.min(limit, 1000)}`;
+      const res = await fetch(url);
+      if (!res.ok) throw new Error(`Binance REST ${res.status}`);
+      const raw = await res.json();
+      return raw.map((c) => ({
+        openTime:  c[0],
+        open:      parseFloat(c[1]),
+        high:      parseFloat(c[2]),
+        low:       parseFloat(c[3]),
+        close:     parseFloat(c[4]),
+        volume:    parseFloat(c[5]),
+        closeTime: c[6],
+        interval,
+        closed: true
+      }));
+    },
+
+    // Combined stream: /stream?streams=btcusdt@kline_5m/ethusdt@kline_5m
+    buildStreamUrl({ testnet, symbols, interval }) {
+      const base = this.wsUrl(testnet);
+      const streams = symbols.map((s) => `${s.toLowerCase()}@kline_${interval}`).join('/');
+      return `${base}/stream?streams=${streams}`;
+    },
+
+    // Returns a normalized candle if the message is a CLOSED kline, else null
+    parseMessage(msg) {
+      const p = msg.data ?? msg;
+      if (p?.e !== 'kline') return null;
+      const k = p.k;
+      if (!k?.x) return null; // not closed
+      return {
+        symbol:    p.s,
+        openTime:  k.t,
+        closeTime: k.T,
+        open:      parseFloat(k.o),
+        high:      parseFloat(k.h),
+        low:       parseFloat(k.l),
+        close:     parseFloat(k.c),
+        volume:    parseFloat(k.v),
+        interval:  k.i,
+        closed:    true
+      };
+    },
+
+    ping() { return null; }
+  },
+
+  bybit: {
+    name: 'bybit',
+
+    restUrl: (testnet) =>
+      testnet ? 'https://api-testnet.bybit.com' : 'https://api.bybit.com',
+
+    wsUrl: (testnet) =>
+      testnet
+        ? 'wss://stream-testnet.bybit.com/v5/public/spot'
+        : 'wss://stream.bybit.com/v5/public/spot',
+
+    // Bybit uses "5" for 5m, "60" for 1h, "D" for 1d
+    mapInterval(tf) {
+      const m = {
+        '1m': '1', '3m': '3', '5m': '5', '15m': '15', '30m': '30',
+        '1h': '60', '2h': '120', '4h': '240', '6h': '360', '12h': '720',
+        '1d': 'D', '1w': 'W', '1M': 'M'
+      };
+      return m[tf] || tf;
+    },
+
+    async fetchKlines({ symbol, interval, limit, testnet }) {
+      const base = this.restUrl(testnet);
+      const iv = this.mapInterval(interval);
+      const url = `${base}/v5/market/kline?category=spot&symbol=${symbol}&interval=${iv}&limit=${Math.min(limit, 1000)}`;
+      const res = await fetch(url);
+      if (!res.ok) throw new Error(`Bybit REST ${res.status}`);
+      const json = await res.json();
+      if (json.retCode !== 0) throw new Error(`Bybit: ${json.retMsg}`);
+      const list = json.result?.list ?? [];
+      // newest first → reverse
+      return list.reverse().map((c) => ({
+        openTime:  parseInt(c[0], 10),
+        open:      parseFloat(c[1]),
+        high:      parseFloat(c[2]),
+        low:       parseFloat(c[3]),
+        close:     parseFloat(c[4]),
+        volume:    parseFloat(c[5]),
+        closeTime: parseInt(c[0], 10) + 60_000,
+        interval,
+        closed: true
+      }));
+    },
+
+    buildStreamUrl({ testnet }) {
+      return this.wsUrl(testnet);
+    },
+
+    // Bybit sends subscription commands — we must send them after open
+    subscriptionMessage({ symbols, interval }) {
+      const iv = this.mapInterval(interval);
+      return JSON.stringify({
+        op: 'subscribe',
+        args: symbols.map((s) => `kline.${iv}.${s}`)
+      });
+    },
+
+    parseMessage(msg) {
+      if (msg.op === 'pong') return null;
+      if (!msg.topic?.startsWith('kline.')) return null;
+      const k = msg.data?.[0];
+      if (!k?.confirm) return null;
+      return {
+        symbol:    k.symbol,
+        openTime:  k.start,
+        closeTime: k.end,
+        open:      parseFloat(k.open),
+        high:      parseFloat(k.high),
+        low:       parseFloat(k.low),
+        close:     parseFloat(k.close),
+        volume:    parseFloat(k.volume),
+        interval:  k.interval,
+        closed:    true
+      };
+    },
+
+    // Bybit requires ping every 20s
+    ping(ws) {
+      if (ws.readyState === WebSocket.OPEN) {
+        try { ws.send(JSON.stringify({ op: 'ping' })); } catch {}
+      }
+    }
+  }
+};
+
+/* ═══════════════════════════════════════════════════════════════
+   MARKET DATA
+   ═══════════════════════════════════════════════════════════════ */
 
 class MarketData extends EventEmitter {
-  constructor() {
+  constructor(config = {}) {
     super();
-    this.priceData = new Map(); // symbol -> { price, volume, timestamp, etc. }
-    this.historicalData = new Map(); // symbol -> Array of OHLCV data
-    this.subscriptions = new Set(); // Active symbol subscriptions
-    this.dataBuffers = new Map(); // symbol -> circular buffer for indicators
-    this.lastUpdate = new Map(); // symbol -> last update timestamp
-    this.reconnectAttempts = 0;
-    this.maxReconnectAttempts = 5;
-    this.reconnectDelay = 5000; // 5 seconds
-    
-    // Data quality metrics
+
+    this.exchange = config.exchange || 'binance';
+    this.testnet = config.testnet ?? false;
+    this.interval = config.interval || '5m';
+    this.historyLimit = config.historyLimit || 200;
+
+    if (!ADAPTERS[this.exchange]) {
+      throw new Error(`Unsupported exchange: ${this.exchange}`);
+    }
+    this.adapter = ADAPTERS[this.exchange];
+
+    // Data stores
+    this.priceData = new Map();      // symbol -> latest tick
+    this.historicalData = new Map(); // symbol -> [candles]
+    this.dataBuffers = new Map();    // symbol -> { prices, volumes, ... }
+    this.lastUpdate = new Map();     // symbol -> timestamp
+    this.subscriptions = new Set();  // subscribed symbols
+
+    // WS state
+    this.ws = null;
+    this.wsReady = false;
+    this.wsReconnectAttempts = 0;
+    this.maxWsReconnectAttempts = 10;
+    this.wsReconnectTimer = null;
+    this.pingTimer = null;
+
+    // Metrics
     this.metrics = {
       totalUpdates: 0,
-      missedUpdates: 0,
       latencySum: 0,
       updateCount: 0
     };
 
     this.isConnected = false;
-    this.activeExchange = null;
   }
 
-  /**
-   * Initialize market data connection
-   * @param {Object} exchangeClient - Exchange client instance
-   * @param {Array} symbols - Symbols to subscribe to
-   */
-  async initialize(exchangeClient, symbols = []) {
-    try {
-      this.activeExchange = exchangeClient;
-      
-      // Load historical data for each symbol
-      for (const symbol of symbols) {
-        await this.loadHistoricalData(symbol);
-      }
+  /* ═══════════════════════════════════════════════════════════════
+     PUBLIC API
+     ═══════════════════════════════════════════════════════════════ */
 
-      // Subscribe to real-time feeds
-      await this.subscribeToFeeds(symbols);
-      
+  /**
+   * Initialize — fetch history + open WebSocket.
+   * @param {string|Array<string>} symbols
+   */
+  async initialize(symbols) {
+    const list = Array.isArray(symbols) ? symbols : [symbols];
+
+    try {
+      // 1. Load history for each symbol (parallel)
+      await Promise.all(list.map((s) => this.loadHistoricalData(s)));
+
+      // 2. Register subscriptions + open WS
+      list.forEach((s) => this.subscriptions.add(s));
+      await this._openWebSocket();
+
       this.isConnected = true;
       this.emit('connected');
-      
-      console.log(`📊 MarketData initialized with ${symbols.length} symbols`);
-      
-    } catch (error) {
-      console.error('❌ MarketData initialization failed:', error);
-      this.emit('error', error);
-      throw error;
+      console.log(`📊 MarketData[${this.exchange}] ready — ${list.join(', ')} @ ${this.interval}`);
+    } catch (err) {
+      console.error('❌ MarketData init failed:', err.message);
+      this.emit('error', err);
+      throw err;
     }
   }
 
   /**
-   * Load historical data for analysis
-   * @param {string} symbol - Trading symbol
-   * @param {string} interval - Time interval (1m, 5m, 1h, etc.)
-   * @param {number} limit - Number of candles to fetch
+   * Fetch history for a symbol.
    */
-  async loadHistoricalData(symbol, interval = '5m', limit = 200) {
-    try {
-      if (!this.activeExchange) {
-        throw new Error('No exchange client available');
-      }
+  async loadHistoricalData(symbol, interval = this.interval, limit = this.historyLimit) {
+    console.log(`📈 ${this.exchange} klines: ${symbol} ${interval} × ${limit}`);
 
-      console.log(`📈 Loading historical data for ${symbol}...`);
-      
-      const candles = await this.activeExchange.getKlines(symbol, interval, limit);
-      
-      if (!candles || candles.length === 0) {
-        throw new Error(`No historical data received for ${symbol}`);
-      }
-
-      // Store historical data
-      this.historicalData.set(symbol, candles);
-      
-      // Initialize data buffer for indicators
-      this.initializeDataBuffer(symbol, candles);
-      
-      // Set current price from latest candle
-      const latestCandle = candles[candles.length - 1];
-      this.updatePrice(symbol, {
-        price: parseFloat(latestCandle.close),
-        volume: parseFloat(latestCandle.volume),
-        timestamp: latestCandle.closeTime,
-        high: parseFloat(latestCandle.high),
-        low: parseFloat(latestCandle.low),
-        open: parseFloat(latestCandle.open)
-      });
-
-      this.emit('historicalDataLoaded', { symbol, candles: candles.length });
-      
-    } catch (error) {
-      console.error(`❌ Failed to load historical data for ${symbol}:`, error);
-      throw error;
-    }
-  }
-
-  /**
-   * Initialize circular buffer for indicator calculations
-   * @param {string} symbol - Trading symbol
-   * @param {Array} initialData - Initial candle data
-   */
-  initializeDataBuffer(symbol, initialData) {
-    const buffer = {
-      prices: [],
-      volumes: [],
-      highs: [],
-      lows: [],
-      opens: [],
-      maxSize: 500 // Keep last 500 data points
-    };
-
-    // Fill buffer with initial data
-    initialData.forEach(candle => {
-      buffer.prices.push(parseFloat(candle.close));
-      buffer.volumes.push(parseFloat(candle.volume));
-      buffer.highs.push(parseFloat(candle.high));
-      buffer.lows.push(parseFloat(candle.low));
-      buffer.opens.push(parseFloat(candle.open));
+    const candles = await this.adapter.fetchKlines({
+      symbol, interval, limit, testnet: this.testnet
     });
 
-    this.dataBuffers.set(symbol, buffer);
-  }
-
-  /**
-   * Subscribe to real-time market data feeds
-   * @param {Array} symbols - Symbols to subscribe to
-   */
-  async subscribeToFeeds(symbols) {
-    try {
-      if (!this.activeExchange) {
-        throw new Error('No exchange client available');
-      }
-
-      for (const symbol of symbols) {
-        this.subscriptions.add(symbol);
-        
-        // Subscribe to price updates
-        await this.activeExchange.subscribeTicker(symbol, (data) => {
-          this.handlePriceUpdate(symbol, data);
-        });
-
-        console.log(`🔔 Subscribed to ${symbol} price feed`);
-      }
-
-    } catch (error) {
-      console.error('❌ Failed to subscribe to feeds:', error);
-      this.handleConnectionError(error);
+    if (!candles?.length) {
+      throw new Error(`No candles for ${symbol}`);
     }
+
+    this.historicalData.set(symbol, candles);
+    this._initBuffer(symbol, candles);
+
+    const last = candles[candles.length - 1];
+    this._updatePrice(symbol, {
+      price: last.close,
+      open: last.open,
+      high: last.high,
+      low: last.low,
+      volume: last.volume,
+      timestamp: last.closeTime,
+      closeTime: last.closeTime,
+      openTime: last.openTime,
+      interval
+    });
+
+    this.emit('historicalDataLoaded', { symbol, count: candles.length });
+    return candles;
   }
 
   /**
-   * Handle incoming price updates
-   * @param {string} symbol - Trading symbol
-   * @param {Object} data - Price update data
+   * Add a new symbol live.
    */
-  handlePriceUpdate(symbol, data) {
-    try {
-      const timestamp = Date.now();
-      const priceData = {
-        price: parseFloat(data.price || data.c),
-        volume: parseFloat(data.volume || data.v || 0),
-        high: parseFloat(data.high || data.h || data.price),
-        low: parseFloat(data.low || data.l || data.price),
-        open: parseFloat(data.open || data.o || data.price),
-        timestamp: timestamp,
-        symbol: symbol
-      };
+  async addSymbol(symbol) {
+    if (this.subscriptions.has(symbol)) return;
 
-      // Update price data
-      this.updatePrice(symbol, priceData);
-      
-      // Update data buffer for indicators
-      this.updateDataBuffer(symbol, priceData);
-      
-      // Calculate latency
-      if (data.timestamp) {
-        const latency = timestamp - data.timestamp;
-        this.updateMetrics(latency);
-      }
+    await this.loadHistoricalData(symbol);
+    this.subscriptions.add(symbol);
 
-      // Emit price update event
-      this.emit('priceUpdate', priceData);
+    // Rebuild WS with the new subscription set
+    await this._openWebSocket();
 
-    } catch (error) {
-      console.error(`❌ Error handling price update for ${symbol}:`, error);
-    }
+    this.emit('symbolAdded', symbol);
   }
 
   /**
-   * Update price data for a symbol
-   * @param {string} symbol - Trading symbol
-   * @param {Object} data - Price data
+   * Remove a symbol.
    */
-  updatePrice(symbol, data) {
-    const existing = this.priceData.get(symbol) || {};
-    
-    const updated = {
-      ...existing,
-      ...data,
-      change: existing.price ? ((data.price - existing.price) / existing.price * 100) : 0,
-      lastUpdate: data.timestamp
-    };
+  async removeSymbol(symbol) {
+    if (!this.subscriptions.has(symbol)) return;
 
-    this.priceData.set(symbol, updated);
-    this.lastUpdate.set(symbol, data.timestamp);
+    this.subscriptions.delete(symbol);
+    this.priceData.delete(symbol);
+    this.dataBuffers.delete(symbol);
+    this.historicalData.delete(symbol);
+    this.lastUpdate.delete(symbol);
+
+    await this._openWebSocket(); // rebuild with one less symbol
+    this.emit('symbolRemoved', symbol);
   }
 
-  /**
-   * Update data buffer for indicator calculations
-   * @param {string} symbol - Trading symbol
-   * @param {Object} data - Price data
-   */
-  updateDataBuffer(symbol, data) {
-    const buffer = this.dataBuffers.get(symbol);
-    if (!buffer) return;
+  /* ═══════════════════════════════════════════════════════════════
+     GETTERS
+     ═══════════════════════════════════════════════════════════════ */
 
-    // Add new data point
-    buffer.prices.push(data.price);
-    buffer.volumes.push(data.volume);
-    buffer.highs.push(data.high);
-    buffer.lows.push(data.low);
-    buffer.opens.push(data.open);
-
-    // Maintain buffer size
-    if (buffer.prices.length > buffer.maxSize) {
-      buffer.prices.shift();
-      buffer.volumes.shift();
-      buffer.highs.shift();
-      buffer.lows.shift();
-      buffer.opens.shift();
-    }
-  }
-
-  /**
-   * Get current price for a symbol
-   * @param {string} symbol - Trading symbol
-   * @returns {Object|null} Price data
-   */
   getCurrentPrice(symbol) {
     return this.priceData.get(symbol) || null;
   }
 
-  /**
-   * Get historical data for a symbol
-   * @param {string} symbol - Trading symbol
-   * @param {number} limit - Number of data points to return
-   * @returns {Array} Historical data
-   */
   getHistoricalData(symbol, limit = 100) {
     const data = this.historicalData.get(symbol) || [];
     return limit ? data.slice(-limit) : data;
   }
 
   /**
-   * Get price data for indicator calculations
-   * @param {string} symbol - Trading symbol
-   * @param {string} type - Data type (prices, volumes, highs, lows, opens)
-   * @param {number} periods - Number of periods to return
-   * @returns {Array} Price data array
+   * Get an array from the rolling buffer.
+   * type: 'prices' | 'volumes' | 'highs' | 'lows' | 'opens'
    */
   getPriceData(symbol, type = 'prices', periods = 50) {
-    const buffer = this.dataBuffers.get(symbol);
-    if (!buffer || !buffer[type]) {
-      return [];
+    const buf = this.dataBuffers.get(symbol);
+    if (!buf || !buf[type]) return [];
+    return periods ? buf[type].slice(-periods) : buf[type];
+  }
+
+  /**
+   * Full OHLC candles reconstructed from the buffer.
+   * Useful for indicator modules that need candles, not just closes.
+   */
+  getCandles(symbol, periods = 100) {
+    const buf = this.dataBuffers.get(symbol);
+    if (!buf) return [];
+    const n = Math.min(periods, buf.prices.length);
+    const out = [];
+    for (let i = buf.prices.length - n; i < buf.prices.length; i++) {
+      out.push({
+        open: buf.opens[i],
+        high: buf.highs[i],
+        low: buf.lows[i],
+        close: buf.prices[i],
+        volume: buf.volumes[i]
+      });
     }
-
-    const data = buffer[type];
-    return periods ? data.slice(-periods) : data;
+    return out;
   }
 
-  /**
-   * Check if symbol data is stale
-   * @param {string} symbol - Trading symbol
-   * @param {number} maxAge - Maximum age in milliseconds
-   * @returns {boolean} True if data is stale
-   */
-  isDataStale(symbol, maxAge = 60000) { // 1 minute default
-    const lastUpdate = this.lastUpdate.get(symbol);
-    if (!lastUpdate) return true;
-    
-    return (Date.now() - lastUpdate) > maxAge;
+  isDataStale(symbol, maxAge = 60_000) {
+    const last = this.lastUpdate.get(symbol);
+    return !last || Date.now() - last > maxAge;
   }
 
-  /**
-   * Get market summary for all subscribed symbols
-   * @returns {Object} Market summary
-   */
   getMarketSummary() {
-    const summary = {};
-    
-    for (const [symbol, data] of this.priceData.entries()) {
-      summary[symbol] = {
-        price: data.price,
-        change: data.change,
-        volume: data.volume,
-        lastUpdate: data.lastUpdate,
+    const out = {};
+    for (const [symbol, d] of this.priceData) {
+      out[symbol] = {
+        price: d.price,
+        change: d.change ?? 0,
+        volume: d.volume,
+        lastUpdate: d.timestamp,
         isStale: this.isDataStale(symbol)
       };
     }
-
-    return summary;
+    return out;
   }
 
-  /**
-   * Update performance metrics
-   * @param {number} latency - Update latency in ms
-   */
-  updateMetrics(latency) {
-    this.metrics.totalUpdates++;
-    this.metrics.updateCount++;
-    this.metrics.latencySum += latency;
-  }
-
-  /**
-   * Get performance metrics
-   * @returns {Object} Performance metrics
-   */
   getMetrics() {
     return {
       ...this.metrics,
-      averageLatency: this.metrics.updateCount > 0 ? 
-        this.metrics.latencySum / this.metrics.updateCount : 0,
+      averageLatency: this.metrics.updateCount
+        ? this.metrics.latencySum / this.metrics.updateCount
+        : 0,
       isConnected: this.isConnected,
-      activeSubscriptions: this.subscriptions.size,
-      reconnectAttempts: this.reconnectAttempts
+      wsConnected: this.wsReady,
+      subscriptions: this.subscriptions.size,
+      exchange: this.exchange,
+      interval: this.interval
     };
   }
 
-  /**
-   * Handle connection errors
-   * @param {Error} error - Connection error
-   */
-  handleConnectionError(error) {
-    console.error('📡 Market data connection error:', error);
-    this.isConnected = false;
-    this.emit('disconnected', error);
+  /* ═══════════════════════════════════════════════════════════════
+     WEBSOCKET
+     ═══════════════════════════════════════════════════════════════ */
 
-    // Attempt reconnection
-    if (this.reconnectAttempts < this.maxReconnectAttempts) {
-      this.reconnectAttempts++;
-      
-      setTimeout(() => {
-        console.log(`🔄 Attempting reconnection ${this.reconnectAttempts}/${this.maxReconnectAttempts}...`);
-        this.reconnect();
-      }, this.reconnectDelay * this.reconnectAttempts);
-    } else {
-      console.error('❌ Max reconnection attempts reached');
-      this.emit('connectionFailed');
+  async _openWebSocket() {
+    // Close any existing socket
+    if (this.ws) {
+      this.ws.removeAllListeners();
+      try { this.ws.close(); } catch {}
+      this.ws = null;
     }
-  }
-
-  /**
-   * Attempt to reconnect to market data feeds
-   */
-  async reconnect() {
-    try {
-      if (this.activeExchange) {
-        const symbols = Array.from(this.subscriptions);
-        await this.subscribeToFeeds(symbols);
-        
-        this.isConnected = true;
-        this.reconnectAttempts = 0;
-        
-        console.log('✅ Market data reconnected successfully');
-        this.emit('reconnected');
-      }
-    } catch (error) {
-      this.handleConnectionError(error);
+    if (this.wsReconnectTimer) {
+      clearTimeout(this.wsReconnectTimer);
+      this.wsReconnectTimer = null;
     }
-  }
-
-  /**
-   * Add new symbol subscription
-   * @param {string} symbol - Symbol to subscribe to
-   */
-  async addSymbol(symbol) {
-    if (this.subscriptions.has(symbol)) {
-      console.log(`📊 Already subscribed to ${symbol}`);
-      return;
+    if (this.pingTimer) {
+      clearInterval(this.pingTimer);
+      this.pingTimer = null;
     }
 
-    try {
-      await this.loadHistoricalData(symbol);
-      
-      if (this.activeExchange && this.isConnected) {
-        await this.activeExchange.subscribeTicker(symbol, (data) => {
-          this.handlePriceUpdate(symbol, data);
-        });
-      }
+    if (this.subscriptions.size === 0) return;
 
-      this.subscriptions.add(symbol);
-      console.log(`✅ Added subscription for ${symbol}`);
-      
-      this.emit('symbolAdded', symbol);
-      
-    } catch (error) {
-      console.error(`❌ Failed to add symbol ${symbol}:`, error);
-      throw error;
-    }
-  }
+    const symbols = Array.from(this.subscriptions);
+    const url = this.adapter.buildStreamUrl({
+      testnet: this.testnet,
+      symbols,
+      interval: this.interval
+    });
 
-  /**
-   * Remove symbol subscription
-   * @param {string} symbol - Symbol to unsubscribe from
-   */
-  async removeSymbol(symbol) {
-    if (!this.subscriptions.has(symbol)) {
-      return;
-    }
+    console.log(`🔌 [${this.exchange}] WS → ${symbols.length} symbol(s)`);
 
-    try {
-      // Unsubscribe from exchange feed
-      if (this.activeExchange && this.isConnected) {
-        await this.activeExchange.unsubscribeTicker(symbol);
-      }
+    this.ws = new WebSocket(url);
 
-      // Clean up data
-      this.subscriptions.delete(symbol);
-      this.priceData.delete(symbol);
-      this.dataBuffers.delete(symbol);
-      this.lastUpdate.delete(symbol);
+    this.ws.on('open', () => {
+      this.wsReady = true;
+      this.wsReconnectAttempts = 0;
+      console.log(`✅ [${this.exchange}] WS connected`);
+      this.emit('ws-open');
 
-      console.log(`🗑️ Removed subscription for ${symbol}`);
-      this.emit('symbolRemoved', symbol);
-      
-    } catch (error) {
-      console.error(`❌ Failed to remove symbol ${symbol}:`, error);
-    }
-  }
-
-  /**
-   * Clean shutdown
-   */
-  async shutdown() {
-    console.log('🛑 Shutting down market data service...');
-    
-    try {
-      // Unsubscribe from all feeds
-      for (const symbol of this.subscriptions) {
-        if (this.activeExchange) {
-          await this.activeExchange.unsubscribeTicker(symbol);
+      // Bybit needs an explicit subscribe command
+      if (this.adapter.subscriptionMessage) {
+        try {
+          this.ws.send(this.adapter.subscriptionMessage({
+            symbols,
+            interval: this.interval
+          }));
+        } catch (err) {
+          console.error('WS subscribe failed:', err.message);
         }
       }
 
-      // Clear all data
-      this.subscriptions.clear();
-      this.priceData.clear();
-      this.dataBuffers.clear();
-      this.lastUpdate.clear();
-      this.historicalData.clear();
+      // Bybit needs periodic ping
+      if (this.adapter.ping) {
+        this.pingTimer = setInterval(() => {
+          try { this.adapter.ping(this.ws); } catch {}
+        }, 20_000);
+      }
+    });
 
-      this.isConnected = false;
-      this.emit('shutdown');
-      
-      console.log('✅ Market data service shut down cleanly');
-      
-    } catch (error) {
-      console.error('❌ Error during market data shutdown:', error);
+    this.ws.on('message', (buf) => {
+      let msg;
+      try { msg = JSON.parse(buf.toString()); } catch { return; }
+
+      const candle = this.adapter.parseMessage(msg);
+      if (candle) this._handleCandle(candle);
+    });
+
+    this.ws.on('error', (err) => {
+      console.error(`[${this.exchange}] WS error:`, err.message);
+      this.emit('ws-error', err);
+    });
+
+    this.ws.on('close', (code, reason) => {
+      this.wsReady = false;
+      if (this.pingTimer) { clearInterval(this.pingTimer); this.pingTimer = null; }
+      console.warn(`[${this.exchange}] WS closed (${code} ${reason || ''})`);
+      this.emit('ws-close', { code });
+      this._scheduleReconnect();
+    });
+  }
+
+  _scheduleReconnect() {
+    if (this.subscriptions.size === 0) return;
+
+    if (this.wsReconnectAttempts >= this.maxWsReconnectAttempts) {
+      console.error(`[${this.exchange}] Max WS reconnects reached`);
+      this.emit('ws-give-up');
+      return;
     }
+
+    this.wsReconnectAttempts++;
+    const delay = Math.min(1000 * 2 ** (this.wsReconnectAttempts - 1), 30_000);
+    console.log(`[${this.exchange}] Reconnect in ${delay}ms (attempt ${this.wsReconnectAttempts})`);
+
+    this.wsReconnectTimer = setTimeout(() => {
+      this._openWebSocket().catch((err) => console.error('Reconnect failed:', err.message));
+    }, delay);
+  }
+
+  /* ═══════════════════════════════════════════════════════════════
+     DATA HANDLING
+     ═══════════════════════════════════════════════════════════════ */
+
+  _handleCandle(candle) {
+    const { symbol } = candle;
+
+    // Compute change vs previous close
+    const prev = this.priceData.get(symbol);
+    const change = prev?.price
+      ? ((candle.close - prev.price) / prev.price) * 100
+      : 0;
+
+    const priceData = {
+      price: candle.close,
+      open: candle.open,
+      high: candle.high,
+      low: candle.low,
+      volume: candle.volume,
+      change,
+      symbol,
+      timestamp: candle.closeTime || Date.now(),
+      openTime: candle.openTime,
+      closeTime: candle.closeTime,
+      interval: candle.interval,
+      closed: true
+    };
+
+    this._updatePrice(symbol, priceData);
+    this._updateBuffer(symbol, priceData);
+
+    // Latency
+    if (candle.closeTime) {
+      const latency = Date.now() - candle.closeTime;
+      this.metrics.totalUpdates++;
+      this.metrics.updateCount++;
+      this.metrics.latencySum += Math.max(latency, 0);
+    }
+
+    // Append to historical list too
+    const hist = this.historicalData.get(symbol) || [];
+    hist.push(candle);
+    if (hist.length > 1000) hist.shift();
+    this.historicalData.set(symbol, hist);
+
+    this.emit('priceUpdate', priceData);
+    this.emit('candle', { symbol, candle });
+  }
+
+  _updatePrice(symbol, data) {
+    const existing = this.priceData.get(symbol) || {};
+    this.priceData.set(symbol, { ...existing, ...data });
+    this.lastUpdate.set(symbol, data.timestamp || Date.now());
+  }
+
+  _initBuffer(symbol, candles) {
+    const buf = {
+      prices: [],
+      volumes: [],
+      highs: [],
+      lows: [],
+      opens: [],
+      maxSize: 500
+    };
+    for (const c of candles) {
+      buf.prices.push(c.close);
+      buf.volumes.push(c.volume);
+      buf.highs.push(c.high);
+      buf.lows.push(c.low);
+      buf.opens.push(c.open);
+    }
+    this.dataBuffers.set(symbol, buf);
+  }
+
+  _updateBuffer(symbol, data) {
+    const buf = this.dataBuffers.get(symbol);
+    if (!buf) return;
+
+    buf.prices.push(data.price);
+    buf.volumes.push(data.volume);
+    buf.highs.push(data.high);
+    buf.lows.push(data.low);
+    buf.opens.push(data.open);
+
+    if (buf.prices.length > buf.maxSize) {
+      buf.prices.shift();
+      buf.volumes.shift();
+      buf.highs.shift();
+      buf.lows.shift();
+      buf.opens.shift();
+    }
+  }
+
+  /* ═══════════════════════════════════════════════════════════════
+     SHUTDOWN
+     ═══════════════════════════════════════════════════════════════ */
+
+  async shutdown() {
+    console.log('🛑 MarketData shutdown…');
+
+    if (this.wsReconnectTimer) { clearTimeout(this.wsReconnectTimer); this.wsReconnectTimer = null; }
+    if (this.pingTimer) { clearInterval(this.pingTimer); this.pingTimer = null; }
+    if (this.ws) {
+      this.ws.removeAllListeners();
+      try { this.ws.close(); } catch {}
+      this.ws = null;
+    }
+
+    this.subscriptions.clear();
+    this.priceData.clear();
+    this.dataBuffers.clear();
+    this.historicalData.clear();
+    this.lastUpdate.clear();
+
+    this.isConnected = false;
+    this.wsReady = false;
+    this.emit('shutdown');
+    console.log('✅ MarketData shut down');
   }
 }
 

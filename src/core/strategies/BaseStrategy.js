@@ -1,3 +1,5 @@
+'use strict';
+
 class BaseStrategy {
   constructor(name, parameters = {}) {
     this.name = name;
@@ -14,164 +16,126 @@ class BaseStrategy {
     };
   }
 
-  // Abstract methods to be implemented by subclasses
-  async analyze(marketData) {
-    throw new Error('analyze() method must be implemented by subclass');
+  /* ─── abstract ─── */
+  async analyze(/* candles, marketData */) {
+    throw new Error('analyze() must be implemented by subclass');
   }
 
-  async generateSignal(symbol, data) {
-    throw new Error('generateSignal() method must be implemented by subclass');
+  /* ─── lifecycle ─── */
+  start() { this.isActive = true;  return true; }
+  stop()  { this.isActive = false; return true; }
+
+  updateParameters(newParams = {}) {
+    this.parameters = { ...this.parameters, ...newParams };
+    if (typeof this.updateSettings === 'function') {
+      this.updateSettings(newParams);
+    }
   }
 
-  // Common methods
-  start() {
-    this.isActive = true;
-    console.log(`Strategy ${this.name} started`);
-  }
-
-  stop() {
-    this.isActive = false;
-    console.log(`Strategy ${this.name} stopped`);
-  }
-
-  updateParameters(newParameters) {
-    this.parameters = { ...this.parameters, ...newParameters };
-    console.log(`Strategy ${this.name} parameters updated:`, this.parameters);
-  }
-
+  /* ─── trade bookkeeping ─── */
   recordTrade(trade) {
     this.trades.push({
       ...trade,
-      timestamp: new Date(),
+      closedAt: new Date(),
       strategy: this.name
     });
-    this.updatePerformance();
+    this._recalcPerformance();
+    return this.performance;
   }
 
-  updatePerformance() {
-    const completedTrades = this.trades.filter(trade => trade.status === 'closed');
-    this.performance.totalTrades = completedTrades.length;
-    
-    const winningTrades = completedTrades.filter(trade => trade.pnl > 0);
-    const losingTrades = completedTrades.filter(trade => trade.pnl <= 0);
-    
-    this.performance.winningTrades = winningTrades.length;
-    this.performance.losingTrades = losingTrades.length;
-    this.performance.totalPnL = completedTrades.reduce((sum, trade) => sum + trade.pnl, 0);
-    this.performance.winRate = completedTrades.length > 0 
-      ? (winningTrades.length / completedTrades.length) * 100 
-      : 0;
+  _recalcPerformance() {
+    const closed = this.trades;
+    const wins = closed.filter((t) => (t.pnl ?? 0) > 0);
+    const losses = closed.filter((t) => (t.pnl ?? 0) <= 0);
+
+    this.performance = {
+      totalTrades: closed.length,
+      winningTrades: wins.length,
+      losingTrades: losses.length,
+      totalPnL: closed.reduce((s, t) => s + (t.pnl ?? 0), 0),
+      winRate: closed.length ? (wins.length / closed.length) * 100 : 0
+    };
+    return this.performance;
   }
 
-  getPerformance() {
-    return { ...this.performance };
-  }
+  getPerformance() { return { ...this.performance }; }
 
   getOpenPositions() {
-    return Array.from(this.positions.values()).filter(pos => pos.status === 'open');
+    return Array.from(this.positions.values()).filter((p) => p.status === 'open');
   }
 
   openPosition(symbol, side, quantity, price) {
-    const positionId = `${symbol}-${Date.now()}`;
+    const id = `${symbol}-${Date.now()}`;
     const position = {
-      id: positionId,
-      symbol,
-      side,
-      quantity,
+      id, symbol, side, quantity,
       entryPrice: price,
-      timestamp: new Date(),
+      openedAt: new Date(),
       status: 'open',
       pnl: 0
     };
-    
-    this.positions.set(positionId, position);
-    console.log(`Position opened: ${JSON.stringify(position)}`);
+    this.positions.set(id, position);
     return position;
   }
 
   closePosition(positionId, exitPrice) {
     const position = this.positions.get(positionId);
-    if (!position) {
-      console.error(`Position ${positionId} not found`);
-      return null;
-    }
+    if (!position) return null;
 
     position.exitPrice = exitPrice;
     position.status = 'closed';
-    
-    // Calculate P&L
-    const multiplier = position.side === 'buy' ? 1 : -1;
-    position.pnl = (exitPrice - position.entryPrice) * position.quantity * multiplier;
-    
+    position.closedAt = new Date();
+
+    const mult = position.side === 'buy' || position.side === 'BUY' ? 1 : -1;
+    position.pnl = (exitPrice - position.entryPrice) * position.quantity * mult;
+
     this.recordTrade(position);
-    console.log(`Position closed: ${JSON.stringify(position)}`);
-    
     return position;
   }
 
-  // Utility methods for common technical analysis
+  /* ─── utility indicators ─── */
   calculateSMA(prices, period) {
-    if (prices.length < period) return null;
-    
-    const sum = prices.slice(-period).reduce((a, b) => a + b, 0);
-    return sum / period;
+    if (!Array.isArray(prices) || prices.length < period) return null;
+    return prices.slice(-period).reduce((a, b) => a + b, 0) / period;
   }
 
+  /** EMA seeded with SMA of first `period` values (standard). */
   calculateEMA(prices, period) {
-    if (prices.length < period) return null;
-    
-    const multiplier = 2 / (period + 1);
-    let ema = prices[0];
-    
-    for (let i = 1; i < prices.length; i++) {
-      ema = (prices[i] * multiplier) + (ema * (1 - multiplier));
+    if (!Array.isArray(prices) || prices.length < period) return null;
+    const k = 2 / (period + 1);
+    let ema = prices.slice(0, period).reduce((a, b) => a + b, 0) / period;
+    for (let i = period; i < prices.length; i++) {
+      ema = prices[i] * k + ema * (1 - k);
     }
-    
     return ema;
   }
 
   calculateRSI(prices, period = 14) {
-    if (prices.length < period + 1) return null;
-    
-    let gains = 0;
-    let losses = 0;
-    
+    if (!Array.isArray(prices) || prices.length < period + 1) return null;
+    let gains = 0, losses = 0;
     for (let i = 1; i <= period; i++) {
-      const change = prices[i] - prices[i - 1];
-      if (change > 0) {
-        gains += change;
-      } else {
-        losses += Math.abs(change);
-      }
+      const d = prices[i] - prices[i - 1];
+      if (d > 0) gains += d;
+      else losses += -d;
     }
-    
     const avgGain = gains / period;
     const avgLoss = losses / period;
-    
     if (avgLoss === 0) return 100;
-    
     const rs = avgGain / avgLoss;
-    return 100 - (100 / (1 + rs));
+    return 100 - 100 / (1 + rs);
   }
 
-  // Risk management helpers
+  /* ─── risk helpers ─── */
   calculatePositionSize(balance, riskPercent, stopLossPercent) {
     const riskAmount = balance * (riskPercent / 100);
     const positionSize = riskAmount / (stopLossPercent / 100);
-    return Math.min(positionSize, balance * 0.1); // Max 10% of balance per trade
+    return Math.min(positionSize, balance * 0.1);
   }
 
   shouldEnterTrade(signal, currentPrice, balance) {
     if (!signal || !this.isActive) return false;
-    
-    // Check if we have enough balance
-    const minBalance = this.parameters.minBalance || 100;
-    if (balance < minBalance) return false;
-    
-    // Check position limits
-    const maxPositions = this.parameters.maxPositions || 5;
-    if (this.getOpenPositions().length >= maxPositions) return false;
-    
+    if (balance < (this.parameters.minBalance ?? 100)) return false;
+    const max = this.parameters.maxPositions ?? 5;
+    if (this.getOpenPositions().length >= max) return false;
     return true;
   }
 }

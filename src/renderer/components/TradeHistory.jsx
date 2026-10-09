@@ -1,5 +1,5 @@
 import React, { useState, useEffect } from 'react';
-import { History, Download, Filter, TrendingUp, TrendingDown } from 'lucide-react';
+import { Download, TrendingUp, TrendingDown, X } from 'lucide-react';
 
 const TradeHistory = () => {
   const [trades, setTrades] = useState([]);
@@ -22,292 +22,391 @@ const TradeHistory = () => {
   });
 
   useEffect(() => {
-    fetchTrades();
+    (async () => {
+      try {
+        const data = await window.electronAPI.getTrades?.();
+        setTrades(data || []);
+      } catch (err) {
+        console.error('Failed to fetch trades:', err);
+      }
+    })();
   }, []);
 
   useEffect(() => {
-    applyFilters();
-    calculateStats();
+    let out = [...trades];
+    if (filters.symbol !== 'all') out = out.filter((t) => t.symbol === filters.symbol);
+    if (filters.type !== 'all') out = out.filter((t) => t.side === filters.type);
+    if (filters.status !== 'all') out = out.filter((t) => t.status === filters.status);
+    if (filters.dateFrom) out = out.filter((t) => new Date(t.timestamp) >= new Date(filters.dateFrom));
+    if (filters.dateTo) out = out.filter((t) => new Date(t.timestamp) <= new Date(filters.dateTo));
+    setFilteredTrades(out);
   }, [trades, filters]);
 
-  const fetchTrades = async () => {
-    try {
-      const tradeData = await window.electronAPI.getTrades();
-      setTrades(tradeData || []);
-    } catch (error) {
-      console.error('Failed to fetch trades:', error);
-    }
-  };
+  useEffect(() => {
+    const closed = filteredTrades.filter((t) => t.status === 'closed');
+    const wins = closed.filter((t) => t.pnl > 0);
+    const losses = closed.filter((t) => t.pnl < 0);
 
-  const applyFilters = () => {
-    let filtered = [...trades];
-
-    if (filters.symbol !== 'all') {
-      filtered = filtered.filter(trade => trade.symbol === filters.symbol);
-    }
-
-    if (filters.type !== 'all') {
-      filtered = filtered.filter(trade => trade.side === filters.type);
-    }
-
-    if (filters.status !== 'all') {
-      filtered = filtered.filter(trade => trade.status === filters.status);
-    }
-
-    if (filters.dateFrom) {
-      filtered = filtered.filter(trade => 
-        new Date(trade.timestamp) >= new Date(filters.dateFrom)
-      );
-    }
-
-    if (filters.dateTo) {
-      filtered = filtered.filter(trade => 
-        new Date(trade.timestamp) <= new Date(filters.dateTo)
-      );
-    }
-
-    setFilteredTrades(filtered);
-  };
-
-  const calculateStats = () => {
-    const completedTrades = filteredTrades.filter(trade => trade.status === 'closed');
-    const winningTrades = completedTrades.filter(trade => trade.pnl > 0);
-    const losingTrades = completedTrades.filter(trade => trade.pnl < 0);
-
-    const totalPnL = completedTrades.reduce((sum, trade) => sum + trade.pnl, 0);
-    const avgWin = winningTrades.length > 0 
-      ? winningTrades.reduce((sum, trade) => sum + trade.pnl, 0) / winningTrades.length 
-      : 0;
-    const avgLoss = losingTrades.length > 0 
-      ? losingTrades.reduce((sum, trade) => sum + trade.pnl, 0) / losingTrades.length 
-      : 0;
+    const totalPnL = closed.reduce((s, t) => s + t.pnl, 0);
+    const avgWin = wins.length ? wins.reduce((s, t) => s + t.pnl, 0) / wins.length : 0;
+    const avgLoss = losses.length ? losses.reduce((s, t) => s + t.pnl, 0) / losses.length : 0;
 
     setStats({
-      totalTrades: completedTrades.length,
-      winningTrades: winningTrades.length,
-      losingTrades: losingTrades.length,
+      totalTrades: closed.length,
+      winningTrades: wins.length,
+      losingTrades: losses.length,
       totalPnL,
-      winRate: completedTrades.length > 0 ? (winningTrades.length / completedTrades.length) * 100 : 0,
+      winRate: closed.length ? (wins.length / closed.length) * 100 : 0,
       avgWin,
       avgLoss
     });
-  };
+  }, [filteredTrades]);
 
   const exportTrades = async () => {
     try {
-      await window.electronAPI.exportTrades(filteredTrades);
-      alert('Trades exported successfully!');
-    } catch (error) {
-      console.error('Failed to export trades:', error);
-      alert('Failed to export trades');
+      await window.electronAPI.exportTrades?.(filteredTrades);
+    } catch (err) {
+      console.error('Failed to export trades:', err);
     }
   };
 
-  const formatCurrency = (value) => {
-    return new Intl.NumberFormat('en-US', {
+  const updateFilter = (key, value) =>
+    setFilters((f) => ({ ...f, [key]: value }));
+
+  const resetFilters = () =>
+    setFilters({ symbol: 'all', type: 'all', status: 'all', dateFrom: '', dateTo: '' });
+
+  const hasActiveFilters = Object.values(filters).some((v) => v !== 'all' && v !== '');
+
+  const fmtMoney = (v) =>
+    new Intl.NumberFormat('en-US', {
       style: 'currency',
       currency: 'USD',
       minimumFractionDigits: 2,
-      maximumFractionDigits: 4
-    }).format(value);
-  };
+      maximumFractionDigits: 2
+    }).format(v || 0);
 
-  const formatPercentage = (value) => {
-    return `${value.toFixed(2)}%`;
-  };
+  const fmtPct = (v) => `${(v || 0).toFixed(1)}%`;
 
-  const getStatusColor = (status) => {
-    switch (status) {
-      case 'open': return 'text-blue-400 bg-blue-900';
-      case 'closed': return 'text-green-400 bg-green-900';
-      case 'cancelled': return 'text-gray-400 bg-gray-700';
-      default: return 'text-gray-400 bg-gray-700';
-    }
-  };
-
-  const getPnLColor = (pnl) => {
-    return pnl > 0 ? 'text-green-400' : pnl < 0 ? 'text-red-400' : 'text-gray-400';
-  };
+  const fmtQty = (v) =>
+    v == null ? '—' : Number(v).toString().replace(/(\.\d*?)0+$/, '$1').replace(/\.$/, '');
 
   return (
-    <div className="p-6 bg-gray-900 text-white min-h-screen">
-      <div className="max-w-7xl mx-auto">
-        <div className="flex justify-between items-center mb-8">
-          <h1 className="text-3xl font-bold flex items-center">
-            <History className="mr-3" />
-            Trade History
-          </h1>
+    <div className="min-h-screen bg-[#0a0e17] text-slate-200">
+      <div className="max-w-[1400px] mx-auto px-8 py-10">
+
+        {/* ═══════════════ HEADER ═══════════════ */}
+        <header className="flex items-start justify-between gap-6 mb-10">
+          <div>
+            <h1 className="text-[22px] font-semibold tracking-tight text-white">
+              Trade History
+            </h1>
+            <p className="text-sm text-slate-500 mt-1">
+              {filteredTrades.length === trades.length
+                ? `${trades.length} trade${trades.length === 1 ? '' : 's'}`
+                : `${filteredTrades.length} of ${trades.length} trades`}
+            </p>
+          </div>
+
           <button
             onClick={exportTrades}
-            className="flex items-center px-4 py-2 bg-blue-600 hover:bg-blue-700 rounded-lg transition-colors"
+            disabled={filteredTrades.length === 0}
+            className="inline-flex items-center gap-2 px-4 py-2 rounded-lg
+                       text-sm font-medium text-slate-200
+                       border border-slate-800 hover:border-slate-700
+                       hover:bg-slate-900/60
+                       disabled:opacity-40 disabled:cursor-not-allowed
+                       transition-colors"
           >
-            <Download className="mr-2" size={20} />
+            <Download size={14} />
             Export CSV
           </button>
-        </div>
+        </header>
 
-        {/* Statistics Cards */}
-        <div className="grid grid-cols-2 md:grid-cols-4 lg:grid-cols-7 gap-4 mb-8">
-          <div className="bg-gray-800 p-4 rounded-lg">
-            <div className="text-sm text-gray-400">Total Trades</div>
-            <div className="text-2xl font-bold">{stats.totalTrades}</div>
-          </div>
-          <div className="bg-gray-800 p-4 rounded-lg">
-            <div className="text-sm text-gray-400">Win Rate</div>
-            <div className="text-2xl font-bold text-green-400">{formatPercentage(stats.winRate)}</div>
-          </div>
-          <div className="bg-gray-800 p-4 rounded-lg">
-            <div className="text-sm text-gray-400">Total P&L</div>
-            <div className={`text-2xl font-bold ${getPnLColor(stats.totalPnL)}`}>
-              {formatCurrency(stats.totalPnL)}
-            </div>
-          </div>
-          <div className="bg-gray-800 p-4 rounded-lg">
-            <div className="text-sm text-gray-400">Winning Trades</div>
-            <div className="text-2xl font-bold text-green-400">{stats.winningTrades}</div>
-          </div>
-          <div className="bg-gray-800 p-4 rounded-lg">
-            <div className="text-sm text-gray-400">Losing Trades</div>
-            <div className="text-2xl font-bold text-red-400">{stats.losingTrades}</div>
-          </div>
-          <div className="bg-gray-800 p-4 rounded-lg">
-            <div className="text-sm text-gray-400">Avg Win</div>
-            <div className="text-2xl font-bold text-green-400">{formatCurrency(stats.avgWin)}</div>
-          </div>
-          <div className="bg-gray-800 p-4 rounded-lg">
-            <div className="text-sm text-gray-400">Avg Loss</div>
-            <div className="text-2xl font-bold text-red-400">{formatCurrency(Math.abs(stats.avgLoss))}</div>
-          </div>
-        </div>
+        {/* ═══════════════ STATS ═══════════════ */}
+        <section className="grid grid-cols-2 md:grid-cols-4 divide-x divide-slate-800/60
+                            border-y border-slate-800/60 mb-10">
+          <BigStat label="Total P&L" value={`${stats.totalPnL >= 0 ? '+' : ''}${fmtMoney(stats.totalPnL)}`}
+                   tone={stats.totalPnL > 0 ? 'up' : stats.totalPnL < 0 ? 'down' : 'neutral'} />
+          <BigStat label="Win Rate" value={fmtPct(stats.winRate)}
+                   tone={stats.winRate >= 50 ? 'up' : 'neutral'} />
+          <BigStat label="Trades" value={stats.totalTrades} />
+          <BigStat label="Avg Win / Loss"
+                   value={<span>
+                     <span className="text-emerald-400">{fmtMoney(stats.avgWin)}</span>
+                     <span className="text-slate-600 mx-2">/</span>
+                     <span className="text-rose-400">{fmtMoney(Math.abs(stats.avgLoss))}</span>
+                   </span>} />
+        </section>
 
-        {/* Filters */}
-        <div className="bg-gray-800 p-6 rounded-lg mb-6">
-          <div className="flex items-center mb-4">
-            <Filter className="mr-2" size={20} />
-            <h2 className="text-xl font-semibold">Filters</h2>
-          </div>
+        {/* ═══════════════ SECONDARY STATS ═══════════════ */}
+        <section className="flex flex-wrap gap-x-10 gap-y-3 mb-10 text-sm">
+          <SmallStat label="Wins" value={stats.winningTrades} />
+          <SmallStat label="Losses" value={stats.losingTrades} />
+          <SmallStat label="Showing" value={`${filteredTrades.length} / ${trades.length}`} />
+        </section>
+
+        {/* ═══════════════ FILTERS ═══════════════ */}
+        <section className="rounded-xl border border-slate-800/80 bg-slate-900/20 p-5 mb-10">
           <div className="grid grid-cols-2 md:grid-cols-5 gap-4">
-            <div>
-              <label className="block text-sm font-medium mb-2">Symbol</label>
-              <select
-                value={filters.symbol}
-                onChange={(e) => setFilters({...filters, symbol: e.target.value})}
-                className="w-full p-2 bg-gray-700 border border-gray-600 rounded focus:border-blue-400"
-              >
-                <option value="all">All Symbols</option>
-                <option value="BTCUSDT">BTC/USDT</option>
-                <option value="ETHUSDT">ETH/USDT</option>
-                <option value="ADAUSDT">ADA/USDT</option>
-              </select>
-            </div>
-            <div>
-              <label className="block text-sm font-medium mb-2">Type</label>
-              <select
-                value={filters.type}
-                onChange={(e) => setFilters({...filters, type: e.target.value})}
-                className="w-full p-2 bg-gray-700 border border-gray-600 rounded focus:border-blue-400"
-              >
-                <option value="all">All Types</option>
-                <option value="buy">Buy</option>
-                <option value="sell">Sell</option>
-              </select>
-            </div>
-            <div>
-              <label className="block text-sm font-medium mb-2">Status</label>
-              <select
-                value={filters.status}
-                onChange={(e) => setFilters({...filters, status: e.target.value})}
-                className="w-full p-2 bg-gray-700 border border-gray-600 rounded focus:border-blue-400"
-              >
-                <option value="all">All Status</option>
-                <option value="open">Open</option>
-                <option value="closed">Closed</option>
-                <option value="cancelled">Cancelled</option>
-              </select>
-            </div>
-            <div>
-              <label className="block text-sm font-medium mb-2">From Date</label>
-              <input
-                type="date"
-                value={filters.dateFrom}
-                onChange={(e) => setFilters({...filters, dateFrom: e.target.value})}
-                className="w-full p-2 bg-gray-700 border border-gray-600 rounded focus:border-blue-400"
-              />
-            </div>
-            <div>
-              <label className="block text-sm font-medium mb-2">To Date</label>
-              <input
-                type="date"
-                value={filters.dateTo}
-                onChange={(e) => setFilters({...filters, dateTo: e.target.value})}
-                className="w-full p-2 bg-gray-700 border border-gray-600 rounded focus:border-blue-400"
-              />
-            </div>
+            <Select
+              label="Symbol"
+              value={filters.symbol}
+              onChange={(v) => updateFilter('symbol', v)}
+              options={[
+                { value: 'all', label: 'All symbols' },
+                { value: 'BTCUSDT', label: 'BTC / USDT' },
+                { value: 'ETHUSDT', label: 'ETH / USDT' },
+                { value: 'ADAUSDT', label: 'ADA / USDT' }
+              ]}
+            />
+            <Select
+              label="Type"
+              value={filters.type}
+              onChange={(v) => updateFilter('type', v)}
+              options={[
+                { value: 'all', label: 'All types' },
+                { value: 'buy', label: 'Buy' },
+                { value: 'sell', label: 'Sell' }
+              ]}
+            />
+            <Select
+              label="Status"
+              value={filters.status}
+              onChange={(v) => updateFilter('status', v)}
+              options={[
+                { value: 'all', label: 'All statuses' },
+                { value: 'open', label: 'Open' },
+                { value: 'closed', label: 'Closed' },
+                { value: 'cancelled', label: 'Cancelled' }
+              ]}
+            />
+            <DateField
+              label="From"
+              value={filters.dateFrom}
+              onChange={(v) => updateFilter('dateFrom', v)}
+            />
+            <DateField
+              label="To"
+              value={filters.dateTo}
+              onChange={(v) => updateFilter('dateTo', v)}
+            />
           </div>
-        </div>
 
-        {/* Trades Table */}
-        <div className="bg-gray-800 rounded-lg overflow-hidden">
-          <div className="overflow-x-auto">
-            <table className="w-full">
-              <thead className="bg-gray-700">
-                <tr>
-                  <th className="px-4 py-3 text-left">Date/Time</th>
-                  <th className="px-4 py-3 text-left">Symbol</th>
-                  <th className="px-4 py-3 text-left">Side</th>
-                  <th className="px-4 py-3 text-right">Quantity</th>
-                  <th className="px-4 py-3 text-right">Entry Price</th>
-                  <th className="px-4 py-3 text-right">Exit Price</th>
-                  <th className="px-4 py-3 text-right">P&L</th>
-                  <th className="px-4 py-3 text-center">Status</th>
-                  <th className="px-4 py-3 text-left">Strategy</th>
-                </tr>
-              </thead>
-              <tbody>
-                {filteredTrades.map((trade, index) => (
-                  <tr key={trade.id || index} className="border-t border-gray-700 hover:bg-gray-750">
-                    <td className="px-4 py-3 text-sm">
-                      {new Date(trade.timestamp).toLocaleString()}
-                    </td>
-                    <td className="px-4 py-3 font-medium">{trade.symbol}</td>
-                    <td className="px-4 py-3">
-                      <div className={`flex items-center ${
-                        trade.side === 'buy' ? 'text-green-400' : 'text-red-400'
-                      }`}>
-                        {trade.side === 'buy' ? <TrendingUp size={16} /> : <TrendingDown size={16} />}
-                        <span className="ml-1 capitalize">{trade.side}</span>
-                      </div>
-                    </td>
-                    <td className="px-4 py-3 text-right font-mono">{trade.quantity}</td>
-                    <td className="px-4 py-3 text-right font-mono">{formatCurrency(trade.entryPrice)}</td>
-                    <td className="px-4 py-3 text-right font-mono">
-                      {trade.exitPrice ? formatCurrency(trade.exitPrice) : '--'}
-                    </td>
-                    <td className={`px-4 py-3 text-right font-mono font-bold ${getPnLColor(trade.pnl)}`}>
-                      {trade.pnl !== 0 ? formatCurrency(trade.pnl) : '--'}
-                    </td>
-                    <td className="px-4 py-3 text-center">
-                      <span className={`px-2 py-1 rounded-full text-xs font-medium ${getStatusColor(trade.status)}`}>
-                        {trade.status}
-                      </span>
-                    </td>
-                    <td className="px-4 py-3 text-sm text-gray-400">{trade.strategy || 'Manual'}</td>
+          {hasActiveFilters && (
+            <div className="flex justify-end mt-4 pt-4 border-t border-slate-800/60">
+              <button
+                onClick={resetFilters}
+                className="text-xs text-slate-500 hover:text-slate-200 transition-colors"
+              >
+                Clear all filters
+              </button>
+            </div>
+          )}
+        </section>
+
+        {/* ═══════════════ TABLE ═══════════════ */}
+        <section>
+          {filteredTrades.length > 0 ? (
+            <div className="rounded-xl border border-slate-800/80 overflow-hidden">
+              <table className="w-full text-sm">
+                <thead>
+                  <tr className="bg-slate-900/40 text-[10px] uppercase tracking-wider text-slate-500">
+                    <th className="text-left  font-medium px-5 py-3">Date</th>
+                    <th className="text-left  font-medium px-5 py-3">Symbol</th>
+                    <th className="text-left  font-medium px-5 py-3">Side</th>
+                    <th className="text-right font-medium px-5 py-3">Quantity</th>
+                    <th className="text-right font-medium px-5 py-3">Entry</th>
+                    <th className="text-right font-medium px-5 py-3">Exit</th>
+                    <th className="text-right font-medium px-5 py-3">P&L</th>
+                    <th className="text-center font-medium px-5 py-3">Status</th>
                   </tr>
-                ))}
-              </tbody>
-            </table>
-            
-            {filteredTrades.length === 0 && (
-              <div className="text-center py-12 text-gray-400">
-                <History size={48} className="mx-auto mb-4 opacity-50" />
-                <p>No trades found matching your filters.</p>
-              </div>
-            )}
-          </div>
-        </div>
+                </thead>
+                <tbody>
+                  {filteredTrades.map((t, i) => {
+                    const isBuy = t.side === 'buy';
+                    const up = t.pnl > 0;
+                    const down = t.pnl < 0;
+                    return (
+                      <tr
+                        key={t.id || i}
+                        className="border-t border-slate-800/40 hover:bg-slate-800/20 transition-colors"
+                      >
+                        <td className="px-5 py-3 text-xs font-mono text-slate-500 whitespace-nowrap">
+                          {new Date(t.timestamp).toLocaleString('en-US', {
+                            month: 'short', day: '2-digit',
+                            hour: '2-digit', minute: '2-digit'
+                          })}
+                        </td>
+                        <td className="px-5 py-3 text-slate-200 font-medium whitespace-nowrap">
+                          {t.symbol}
+                        </td>
+                        <td className="px-5 py-3">
+                          <span className={`inline-flex items-center gap-1 text-xs font-medium ${
+                            isBuy ? 'text-emerald-400' : 'text-rose-400'
+                          }`}>
+                            {isBuy ? <TrendingUp size={11} /> : <TrendingDown size={11} />}
+                            {t.side?.toUpperCase()}
+                          </span>
+                        </td>
+                        <td className="px-5 py-3 text-right font-mono text-slate-400">
+                          {fmtQty(t.quantity)}
+                        </td>
+                        <td className="px-5 py-3 text-right font-mono text-slate-300">
+                          {fmtMoney(t.entryPrice)}
+                        </td>
+                        <td className="px-5 py-3 text-right font-mono text-slate-500">
+                          {t.exitPrice ? fmtMoney(t.exitPrice) : '—'}
+                        </td>
+                        <td className={`px-5 py-3 text-right font-mono font-medium whitespace-nowrap ${
+                          up ? 'text-emerald-400' : down ? 'text-rose-400' : 'text-slate-500'
+                        }`}>
+                          {up || down ? `${up ? '+' : ''}${fmtMoney(t.pnl)}` : '—'}
+                        </td>
+                        <td className="px-5 py-3 text-center">
+                          <span className={`text-[11px] font-medium ${
+                            t.status === 'open' ? 'text-blue-400' :
+                            t.status === 'closed' ? 'text-slate-400' :
+                            'text-slate-600'
+                          }`}>
+                            {t.status}
+                          </span>
+                        </td>
+                      </tr>
+                    );
+                  })}
+                </tbody>
+              </table>
+            </div>
+          ) : (
+            <EmptyState hasFilters={hasActiveFilters} onReset={resetFilters} />
+          )}
+        </section>
+
+      </div>
+
+      {/* ═══════════════ STYLES ═══════════════ */}
+      <style>{`
+        .input {
+          width: 100%;
+          padding: 0.5rem 0.75rem;
+          background-color: rgb(10 14 23 / 0.6);
+          border: 1px solid rgb(30 41 59 / 0.8);
+          border-radius: 0.5rem;
+          color: rgb(226 232 240);
+          font-size: 0.8125rem;
+          outline: none;
+          transition: border-color 0.15s ease;
+        }
+        .input:hover:not(:disabled) { border-color: rgb(51 65 85); }
+        .input:focus { border-color: rgb(99 102 241 / 0.6); }
+        .input::-webkit-calendar-picker-indicator { filter: invert(0.5); cursor: pointer; }
+        select.input {
+          cursor: pointer;
+          appearance: none;
+          padding-right: 2rem;
+          background-image: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='10' height='10' viewBox='0 0 24 24' fill='none' stroke='%2364748b' stroke-width='2.5'%3E%3Cpath d='m6 9 6 6 6-6'/%3E%3C/svg%3E");
+          background-repeat: no-repeat;
+          background-position: right 0.75rem center;
+        }
+      `}</style>
+    </div>
+  );
+};
+
+/* ═══════════════════════════════════════════════════════════════
+   HELPERS
+   ═══════════════════════════════════════════════════════════════ */
+
+const BigStat = ({ label, value, tone = 'neutral' }) => {
+  const toneClass = {
+    up: 'text-emerald-400',
+    down: 'text-rose-400',
+    neutral: 'text-white'
+  }[tone];
+
+  return (
+    <div className="px-6 py-6">
+      <div className="text-[10px] font-medium text-slate-500 uppercase tracking-wider mb-2">
+        {label}
+      </div>
+      <div className={`text-2xl font-semibold font-mono tracking-tight ${toneClass}`}>
+        {value}
       </div>
     </div>
   );
 };
 
-export default TradeHistory; // <- THIS IS CRUCIAL
+const SmallStat = ({ label, value }) => (
+  <div className="flex items-baseline gap-2">
+    <span className="text-slate-500">{label}</span>
+    <span className="font-mono font-medium text-slate-300">{value}</span>
+  </div>
+);
+
+const Select = ({ label, value, onChange, options }) => (
+  <div className="min-w-0">
+    <label className="block text-[10px] font-medium text-slate-500 uppercase tracking-wider mb-1.5">
+      {label}
+    </label>
+    <select
+      value={value}
+      onChange={(e) => onChange(e.target.value)}
+      className="input"
+    >
+      {options.map((o) => (
+        <option key={o.value} value={o.value}>{o.label}</option>
+      ))}
+    </select>
+  </div>
+);
+
+const DateField = ({ label, value, onChange }) => (
+  <div className="min-w-0">
+    <label className="block text-[10px] font-medium text-slate-500 uppercase tracking-wider mb-1.5">
+      {label}
+    </label>
+    <div className="relative">
+      <input
+        type="date"
+        value={value}
+        onChange={(e) => onChange(e.target.value)}
+        className="input font-mono"
+      />
+      {value && (
+        <button
+          type="button"
+          onClick={() => onChange('')}
+          className="absolute right-2 top-1/2 -translate-y-1/2 p-1 rounded
+                     text-slate-500 hover:text-slate-200 transition-colors"
+          aria-label="Clear date"
+        >
+          <X size={11} />
+        </button>
+      )}
+    </div>
+  </div>
+);
+
+const EmptyState = ({ hasFilters, onReset }) => (
+  <div className="border border-dashed border-slate-800 rounded-xl py-20 text-center">
+    <p className="text-slate-400 text-sm">
+      {hasFilters ? 'No matching trades' : 'No trades yet'}
+    </p>
+    <p className="text-slate-600 text-xs mt-2">
+      {hasFilters
+        ? 'Try adjusting or clearing the filters above'
+        : 'Your executed trades will appear here once the bot starts trading'}
+    </p>
+    {hasFilters && (
+      <button
+        onClick={onReset}
+        className="mt-5 text-xs text-indigo-400 hover:text-indigo-300 transition-colors"
+      >
+        Clear all filters
+      </button>
+    )}
+  </div>
+);
+
+export default TradeHistory;

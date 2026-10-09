@@ -1,470 +1,405 @@
-import React, { useState, useEffect } from 'react';
-import { Play, Square, AlertCircle, TrendingUp, TrendingDown, BarChart3, Settings } from 'lucide-react';
+// src/renderer/components/Dashboard.jsx
+import React, { useState, useEffect, useCallback } from 'react';
+import { Play, Square, AlertCircle } from 'lucide-react';
 import Chart from './Chart';
 import Portfolio from './Portfolio';
 import TradeHistory from './TradeHistory';
 
 const Dashboard = () => {
-  const [botStatus, setBotStatus] = useState({
-    isRunning: false,
-    positions: [],
-    stats: {}
-  });
-  
-  const [balances, setBalances] = useState({
-    current: 0,
-    start: 0,
-    change: 0,
-    changePercent: 0
-  });
-  
+  const [botStatus, setBotStatus] = useState({ isRunning: false, positions: [], stats: {} });
+  const [balances, setBalances] = useState({ current: 0, start: 0, change: 0, changePercent: 0 });
   const [trades, setTrades] = useState([]);
   const [statusMessages, setStatusMessages] = useState([]);
   const [selectedPair, setSelectedPair] = useState('BTCUSDT');
-  const [prices, setPrices] = useState({});
   const [isLoading, setIsLoading] = useState(true);
 
-  useEffect(() => {
-    // Initialize dashboard
-    initializeDashboard();
-    
-    // Setup event listeners
-    if (window.electronAPI) {
-      // Bot events
-      window.electronAPI.onBotStatus((event, status) => {
-        addStatusMessage(status.message, status.type);
-      });
-      
-      window.electronAPI.onBotTrade((event, tradeData) => {
-        handleNewTrade(tradeData);
-      });
-      
-      window.electronAPI.onBotError((event, error) => {
-        addStatusMessage(error, 'error');
-      });
-      
-      window.electronAPI.onBalanceUpdate((event, newBalances) => {
-        setBalances(newBalances);
-      });
-      
-      // Menu triggers
-      window.electronAPI.onToggleBot((event, shouldStart) => {
-        if (shouldStart) {
-          startBot();
-        } else {
-          stopBot();
-        }
-      });
-      
-      window.electronAPI.onEmergencyStop(() => {
-        emergencyStop();
-      });
-    }
-    
-    // Cleanup listeners
-    return () => {
-      if (window.electronAPI) {
-        window.electronAPI.removeAllListeners('bot-status');
-        window.electronAPI.removeAllListeners('bot-trade');
-        window.electronAPI.removeAllListeners('bot-error');
-        window.electronAPI.removeAllListeners('balance-update');
-        window.electronAPI.removeAllListeners('toggle-bot');
-        window.electronAPI.removeAllListeners('emergency-stop');
-      }
-    };
+  /* ────────── helpers (defined with useCallback so effects get stable refs) ────────── */
+  const addStatusMessage = useCallback((message, type = 'info') => {
+    setStatusMessages((prev) => [
+      { id: Date.now() + Math.random(), message, type, timestamp: new Date() },
+      ...prev.slice(0, 99)
+    ]);
   }, []);
 
-  // Periodic updates
-  useEffect(() => {
-    const interval = setInterval(() => {
-      if (botStatus.isRunning) {
-        updateBotStatus();
-      }
-    }, 5000);
-    
-    return () => clearInterval(interval);
-  }, [botStatus.isRunning]);
-
-  const initializeDashboard = async () => {
-    try {
-      if (window.electronAPI) {
-        // Get initial bot status
-        const status = await window.electronAPI.getBotStatus();
-        setBotStatus(status);
-        
-        // Get trade history
-        const tradeHistory = await window.electronAPI.getTradeHistory(50);
-        setTrades(tradeHistory);
-      }
-      
-      setIsLoading(false);
-      addStatusMessage('Dashboard initialized', 'info');
-    } catch (error) {
-      console.error('Failed to initialize dashboard:', error);
-      addStatusMessage('Failed to initialize dashboard', 'error');
-      setIsLoading(false);
-    }
-  };
-
-  const updateBotStatus = async () => {
-    try {
-      if (window.electronAPI) {
-        const status = await window.electronAPI.getBotStatus();
-        setBotStatus(status);
-      }
-    } catch (error) {
-      console.error('Failed to update bot status:', error);
-    }
-  };
-
-  const startBot = async () => {
-    try {
-      if (window.electronAPI) {
-        // Load configuration
-        const config = await window.electronAPI.loadConfig();
-        
-        // Load API keys
-        const apiKeys = await window.electronAPI.loadApiKeys();
-        if (!apiKeys) {
-          addStatusMessage('Please configure API keys first', 'error');
-          return;
-        }
-        
-        const fullConfig = { ...config, apiKeys };
-        const result = await window.electronAPI.startBot(fullConfig);
-        
-        if (result.success) {
-          addStatusMessage('Bot started successfully', 'success');
-          updateBotStatus();
-        } else {
-          addStatusMessage(`Failed to start bot: ${result.error}`, 'error');
-        }
-      }
-    } catch (error) {
-      console.error('Failed to start bot:', error);
-      addStatusMessage(`Failed to start bot: ${error.message}`, 'error');
-    }
-  };
-
-  const stopBot = async () => {
-    try {
-      if (window.electronAPI) {
-        const result = await window.electronAPI.stopBot();
-        
-        if (result.success) {
-          addStatusMessage('Bot stopped', 'info');
-          setBotStatus(prev => ({ ...prev, isRunning: false }));
-        } else {
-          addStatusMessage(`Failed to stop bot: ${result.error}`, 'error');
-        }
-      }
-    } catch (error) {
-      console.error('Failed to stop bot:', error);
-      addStatusMessage(`Failed to stop bot: ${error.message}`, 'error');
-    }
-  };
-
-  const emergencyStop = async () => {
-    if (window.confirm('Emergency stop will close all positions immediately. Continue?')) {
-      try {
-        await stopBot();
-        addStatusMessage('Emergency stop executed', 'warning');
-      } catch (error) {
-        addStatusMessage('Emergency stop failed', 'error');
-      }
-    }
-  };
-
-  const handleNewTrade = (tradeData) => {
-    const newTrade = {
-      id: Date.now(),
-      timestamp: new Date(),
-      ...tradeData
-    };
-    
-    setTrades(prev => [newTrade, ...prev.slice(0, 99)]); // Keep last 100 trades
-    
-    const message = tradeData.type === 'BUY' 
-      ? `Bought ${tradeData.pair} at ${tradeData.position.entryPrice}`
-      : `Sold ${tradeData.pair} - P&L: ${tradeData.pnl?.toFixed(2)} USDT`;
-      
-    addStatusMessage(message, tradeData.type === 'BUY' ? 'success' : 
-      tradeData.pnl > 0 ? 'success' : 'warning');
-  };
-
-  const addStatusMessage = (message, type = 'info') => {
-    const newMessage = {
-      id: Date.now(),
-      message,
-      type,
-      timestamp: new Date()
-    };
-    
-    setStatusMessages(prev => [newMessage, ...prev.slice(0, 99)]);
-  };
-
-  const formatCurrency = (value) => {
-    return new Intl.NumberFormat('en-US', {
+  const fmtMoney = useCallback((v) =>
+    new Intl.NumberFormat('en-US', {
       style: 'currency',
       currency: 'USD',
       minimumFractionDigits: 2
-    }).format(value);
+    }).format(v || 0), []);
+
+  const handleNewTrade = useCallback((d) => {
+    setTrades((prev) => [
+      { id: Date.now(), timestamp: new Date(), ...d },
+      ...prev.slice(0, 99)
+    ]);
+    const msg = d.type === 'BUY'
+      ? `Bought ${d.pair} @ ${d.position?.entryPrice}`
+      : `Sold ${d.pair} · P&L ${fmtMoney(d.pnl)}`;
+    addStatusMessage(msg, d.type === 'BUY' ? 'success' : (d.pnl > 0 ? 'success' : 'warning'));
+  }, [addStatusMessage, fmtMoney]);
+
+  /* ────────── data fetch ────────── */
+  const updateBotStatus = useCallback(async () => {
+    try {
+      if (window.electronAPI?.getBotStatus) {
+        setBotStatus(await window.electronAPI.getBotStatus());
+      }
+    } catch (err) { console.error(err); }
+  }, []);
+
+  const initializeDashboard = useCallback(async () => {
+    try {
+      if (window.electronAPI) {
+        setBotStatus(await window.electronAPI.getBotStatus());
+        setTrades((await window.electronAPI.getTradeHistory(50)) || []);
+      }
+      addStatusMessage('Dashboard initialized', 'info');
+    } catch (err) {
+      console.error(err);
+      addStatusMessage('Failed to initialize dashboard', 'error');
+    } finally {
+      setIsLoading(false);
+    }
+  }, [addStatusMessage]);
+
+  /* ────────── bot control ────────── */
+  const startBot = useCallback(async () => {
+    try {
+      if (!window.electronAPI) return;
+
+      // ✅ SIMPLE: just call startBot. Main handles keys, config, everything.
+      const res = await window.electronAPI.startBot({});
+
+      if (res?.success) {
+        const mode = res.mode === 'live' ? 'LIVE' : 'PAPER';
+        addStatusMessage(
+          `Bot started · ${mode} mode · ${(res.pairs || []).join(', ')}`,
+          res.mode === 'live' ? 'success' : 'warning'
+        );
+        updateBotStatus();
+      } else {
+        addStatusMessage(`Failed to start: ${res?.error || 'unknown error'}`, 'error');
+      }
+    } catch (err) {
+      addStatusMessage(`Failed to start: ${err.message}`, 'error');
+    }
+  }, [addStatusMessage, updateBotStatus]);
+
+  const stopBot = useCallback(async () => {
+    try {
+      if (!window.electronAPI) return;
+      const res = await window.electronAPI.stopBot();
+      if (res?.success) {
+        addStatusMessage('Bot stopped', 'info');
+        setBotStatus((s) => ({ ...s, isRunning: false }));
+      } else {
+        addStatusMessage(`Failed to stop: ${res?.error || 'unknown'}`, 'error');
+      }
+    } catch (err) {
+      addStatusMessage(`Failed to stop: ${err.message}`, 'error');
+    }
+  }, [addStatusMessage]);
+
+  const emergencyStop = useCallback(async () => {
+    if (!window.confirm('Emergency stop will close all positions immediately. Continue?')) return;
+    await stopBot();
+    addStatusMessage('Emergency stop executed', 'warning');
+  }, [stopBot, addStatusMessage]);
+
+  /* ────────── mount: init + subscribe ────────── */
+  useEffect(() => {
+    initializeDashboard();
+    if (!window.electronAPI) return;
+
+    window.electronAPI.onBotStatus((_, s) => addStatusMessage(s.message, s.type));
+    window.electronAPI.onBotTrade((_, t) => handleNewTrade(t));
+    window.electronAPI.onBotError((_, e) => addStatusMessage(e, 'error'));
+    window.electronAPI.onBalanceUpdate((_, b) => setBalances(b));
+    window.electronAPI.onToggleBot((_, start) => (start ? startBot() : stopBot()));
+    window.electronAPI.onEmergencyStop(() => emergencyStop());
+
+    return () => {
+      if (!window.electronAPI) return;
+      ['bot-status', 'bot-trade', 'bot-error', 'balance-update', 'toggle-bot', 'emergency-stop']
+        .forEach((ch) => window.electronAPI.removeAllListeners(ch));
+    };
+  }, [initializeDashboard, addStatusMessage, handleNewTrade, startBot, stopBot, emergencyStop]);
+
+  /* ────────── polling ────────── */
+  useEffect(() => {
+    const id = setInterval(() => {
+      if (botStatus.isRunning) updateBotStatus();
+    }, 5000);
+    return () => clearInterval(id);
+  }, [botStatus.isRunning, updateBotStatus]);
+
+  /* ────────── formatters ────────── */
+  const fmtPct = (v) => {
+    const n = v || 0;
+    return `${n >= 0 ? '+' : ''}${n.toFixed(2)}%`;
   };
 
-  const formatPercent = (value) => {
-    const sign = value >= 0 ? '+' : '';
-    return `${sign}${value.toFixed(2)}%`;
-  };
-
+  /* ────────── loading screen ────────── */
   if (isLoading) {
     return (
-      <div className="flex items-center justify-center h-screen bg-gray-900">
+      <div className="h-screen flex items-center justify-center bg-[#0a0e17]">
         <div className="text-center">
-          <div className="animate-spin rounded-full h-32 w-32 border-b-2 border-blue-500 mx-auto"></div>
-          <p className="text-white mt-4">Loading Dashboard...</p>
+          <div className="w-8 h-8 mx-auto mb-3 rounded-full border-2 border-slate-800 border-t-indigo-500 animate-spin" />
+          <p className="text-xs text-slate-500">Loading dashboard…</p>
         </div>
       </div>
     );
   }
 
+  const stats = botStatus.stats || {};
+  const totalPnL = stats.totalPnL || 0;
+  const pnlUp = totalPnL >= 0;
+
   return (
-    <div className="min-h-screen bg-gray-900 text-white">
-      {/* Header */}
-      <header className="bg-gray-800 border-b border-gray-700 px-6 py-4">
-        <div className="flex items-center justify-between">
-          <div className="flex items-center space-x-4">
-            <h1 className="text-2xl font-bold text-white">Privacy Trading Bot</h1>
-            <div className={`flex items-center space-x-2 px-3 py-1 rounded-full text-sm ${
-              botStatus.isRunning 
-                ? 'bg-green-600 text-white' 
-                : 'bg-red-600 text-white'
+    <div className="h-full flex flex-col bg-[#0a0e17] text-slate-200 overflow-hidden">
+
+      {/* ═══════════════ HEADER ═══════════════ */}
+      <header className="flex-shrink-0 h-14 px-6 border-b border-slate-800/60
+                         flex items-center justify-between gap-6">
+        <div className="flex items-center gap-5 min-w-0">
+          <h1 className="text-sm font-semibold tracking-tight text-white whitespace-nowrap">
+            Privacy Trading Bot
+          </h1>
+
+          <div className="flex items-center gap-2 text-xs">
+            <span className="relative flex h-1.5 w-1.5">
+              {botStatus.isRunning && (
+                <span className="absolute inline-flex h-full w-full rounded-full bg-emerald-400 opacity-60 animate-ping" />
+              )}
+              <span className={`relative inline-flex rounded-full h-1.5 w-1.5 ${
+                botStatus.isRunning ? 'bg-emerald-400' : 'bg-slate-600'
+              }`} />
+            </span>
+            <span className={`font-medium ${
+              botStatus.isRunning ? 'text-emerald-400' : 'text-slate-500'
             }`}>
-              <div className={`w-2 h-2 rounded-full ${
-                botStatus.isRunning ? 'bg-green-300' : 'bg-red-300'
-              }`}></div>
-              <span>{botStatus.isRunning ? 'Active' : 'Stopped'}</span>
+              {botStatus.isRunning ? 'Active' : 'Stopped'}
+            </span>
+          </div>
+        </div>
+
+        <div className="flex items-center gap-6">
+          <div className="text-right">
+            <div className="text-[10px] uppercase tracking-wider text-slate-600">Balance</div>
+            <div className="text-sm font-mono font-medium text-white leading-tight mt-0.5">
+              {fmtMoney(balances.current)}
+              <span className={`ml-2 text-[11px] ${
+                balances.change >= 0 ? 'text-emerald-400' : 'text-rose-400'
+              }`}>
+                {fmtPct(balances.changePercent)}
+              </span>
             </div>
           </div>
-          
-          <div className="flex items-center space-x-4">
-            {/* Balance Display */}
-            <div className="text-right">
-              <div className="text-sm text-gray-400">Balance</div>
-              <div className="text-lg font-semibold">
-                {formatCurrency(balances.current)}
-              </div>
-              <div className={`text-xs ${
-                balances.change >= 0 ? 'text-green-400' : 'text-red-400'
-              }`}>
-                {formatCurrency(balances.change)} ({formatPercent(balances.changePercent)})
-              </div>
-            </div>
 
-            {/* Control Buttons */}
-            <div className="flex space-x-2">
-              <button
-                onClick={botStatus.isRunning ? stopBot : startBot}
-                className={`flex items-center space-x-2 px-4 py-2 rounded-lg font-medium transition-colors ${
-                  botStatus.isRunning
-                    ? 'bg-red-600 hover:bg-red-700 text-white'
-                    : 'bg-green-600 hover:bg-green-700 text-white'
-                }`}
-              >
-                {botStatus.isRunning ? <Square size={16} /> : <Play size={16} />}
-                <span>{botStatus.isRunning ? 'Stop' : 'Start'}</span>
-              </button>
-              
-              <button
-                onClick={emergencyStop}
-                className="flex items-center space-x-2 px-4 py-2 rounded-lg font-medium bg-orange-600 hover:bg-orange-700 text-white transition-colors"
-              >
-                <AlertCircle size={16} />
-                <span>Emergency</span>
-              </button>
-            </div>
+          <div className="flex items-center gap-2">
+            <button
+              onClick={botStatus.isRunning ? stopBot : startBot}
+              className={`flex items-center gap-1.5 px-3.5 py-1.5 rounded-md text-xs font-medium
+                          transition-colors ${
+                botStatus.isRunning
+                  ? 'bg-rose-500/90 hover:bg-rose-500 text-white'
+                  : 'bg-emerald-500/90 hover:bg-emerald-500 text-white'
+              }`}
+            >
+              {botStatus.isRunning ? <Square size={12} /> : <Play size={12} />}
+              {botStatus.isRunning ? 'Stop' : 'Start'}
+            </button>
+
+            <button
+              onClick={emergencyStop}
+              title="Emergency stop"
+              className="flex items-center gap-1.5 px-3 py-1.5 rounded-md text-xs font-medium
+                         text-slate-400 hover:text-amber-400 hover:bg-amber-500/10
+                         border border-slate-800 hover:border-amber-500/30
+                         transition-colors"
+            >
+              <AlertCircle size={12} />
+              <span className="hidden md:inline">Emergency</span>
+            </button>
           </div>
         </div>
       </header>
 
-      <div className="flex h-[calc(100vh-80px)]">
-        {/* Sidebar - Trading Stats */}
-        <div className="w-80 bg-gray-800 border-r border-gray-700 p-6 overflow-y-auto">
-          {/* Performance Stats */}
-          <div className="mb-6">
-            <h3 className="text-lg font-semibold mb-4 flex items-center">
-              <BarChart3 size={20} className="mr-2" />
-              Performance
-            </h3>
-            
-            <div className="space-y-4">
-              <div className="bg-gray-700 rounded-lg p-4">
-                <div className="text-sm text-gray-400 mb-1">Total P&L</div>
-                <div className={`text-xl font-bold ${
-                  botStatus.stats.totalPnL >= 0 ? 'text-green-400' : 'text-red-400'
-                }`}>
-                  {formatCurrency(botStatus.stats.totalPnL || 0)}
-                </div>
-              </div>
-              
-              <div className="bg-gray-700 rounded-lg p-4">
-                <div className="text-sm text-gray-400 mb-1">ROI</div>
-                <div className={`text-xl font-bold ${
-                  botStatus.stats.roi >= 0 ? 'text-green-400' : 'text-red-400'
-                }`}>
-                  {formatPercent(botStatus.stats.roi || 0)}
-                </div>
-              </div>
+      {/* ═══════════════ METRICS STRIP ═══════════════ */}
+      <div className="flex-shrink-0 border-b border-slate-800/60
+                      grid grid-cols-3 md:grid-cols-5 divide-x divide-slate-800/60">
+        <Metric
+          label="Total P&L"
+          value={`${pnlUp ? '+' : ''}${fmtMoney(totalPnL)}`}
+          tone={pnlUp ? 'up' : 'down'}
+        />
+        <Metric
+          label="ROI"
+          value={fmtPct(stats.roi || 0)}
+          tone={(stats.roi || 0) >= 0 ? 'up' : 'down'}
+        />
+        <Metric
+          label="Win Rate"
+          value={`${(stats.winRate || 0).toFixed(1)}%`}
+          tone={(stats.winRate || 0) >= 50 ? 'up' : 'neutral'}
+        />
+        <Metric label="Trades" value={stats.totalTrades || 0} tone="neutral" />
+        <Metric
+          label="Open"
+          value={stats.openPositions ?? botStatus.positions.length ?? 0}
+          tone="neutral"
+        />
+      </div>
 
-              <div className="grid grid-cols-2 gap-4">
-                <div className="bg-gray-700 rounded-lg p-3">
-                  <div className="text-xs text-gray-400 mb-1">Total Trades</div>
-                  <div className="text-lg font-semibold">{botStatus.stats.totalTrades || 0}</div>
-                </div>
-                
-                <div className="bg-gray-700 rounded-lg p-3">
-                  <div className="text-xs text-gray-400 mb-1">Win Rate</div>
-                  <div className="text-lg font-semibold text-blue-400">
-                    {(botStatus.stats.winRate || 0).toFixed(1)}%
-                  </div>
-                </div>
-              </div>
+      {/* ═══════════════ BODY ═══════════════ */}
+      <div className="flex-1 flex overflow-hidden min-h-0">
 
-              <div className="grid grid-cols-2 gap-4">
-                <div className="bg-gray-700 rounded-lg p-3">
-                  <div className="text-xs text-gray-400 mb-1">Profitable</div>
-                  <div className="text-lg font-semibold text-green-400">
-                    {botStatus.stats.profitableTrades || 0}
-                  </div>
-                </div>
-                
-                <div className="bg-gray-700 rounded-lg p-3">
-                  <div className="text-xs text-gray-400 mb-1">Open Positions</div>
-                  <div className="text-lg font-semibold text-yellow-400">
-                    {botStatus.stats.openPositions || 0}
-                  </div>
-                </div>
-              </div>
-            </div>
-          </div>
-
-          {/* Current Positions */}
-          <div className="mb-6">
-            <h3 className="text-lg font-semibold mb-4">Open Positions</h3>
-            
-            {botStatus.positions.length === 0 ? (
-              <div className="text-gray-400 text-center py-4">No open positions</div>
-            ) : (
-              <div className="space-y-3">
-                {botStatus.positions.map((position, index) => (
-                  <div key={index} className="bg-gray-700 rounded-lg p-3">
-                    <div className="flex justify-between items-center mb-2">
-                      <span className="font-semibold">{position.pair}</span>
-                      <span className={`px-2 py-1 rounded text-xs ${
-                        position.side === 'BUY' ? 'bg-green-600' : 'bg-red-600'
-                      }`}>
-                        {position.side}
-                      </span>
-                    </div>
-                    
-                    <div className="text-sm space-y-1">
-                      <div className="flex justify-between">
-                        <span className="text-gray-400">Entry:</span>
-                        <span>${position.entryPrice.toFixed(4)}</span>
-                      </div>
-                      <div className="flex justify-between">
-                        <span className="text-gray-400">Quantity:</span>
-                        <span>{position.quantity.toFixed(6)}</span>
-                      </div>
-                      <div className="flex justify-between">
-                        <span className="text-gray-400">Unrealized P&L:</span>
-                        <span className={
-                          position.unrealizedPnL >= 0 ? 'text-green-400' : 'text-red-400'
-                        }>
-                          {formatCurrency(position.unrealizedPnL || 0)}
-                        </span>
-                      </div>
-                    </div>
-                  </div>
-                ))}
-              </div>
-            )}
-          </div>
-
-          {/* Status Messages */}
-          <div>
-            <h3 className="text-lg font-semibold mb-4">Status Log</h3>
-            
-            <div className="space-y-2 max-h-64 overflow-y-auto">
-              {statusMessages.slice(0, 20).map((msg) => (
-                <div key={msg.id} className={`p-2 rounded text-sm ${
-                  msg.type === 'success' ? 'bg-green-900 text-green-200' :
-                  msg.type === 'error' ? 'bg-red-900 text-red-200' :
-                  msg.type === 'warning' ? 'bg-yellow-900 text-yellow-200' :
-                  'bg-gray-700 text-gray-300'
-                }`}>
-                  <div className="flex justify-between items-start">
-                    <span className="flex-1">{msg.message}</span>
-                    <span className="text-xs opacity-60 ml-2">
-                      {msg.timestamp.toLocaleTimeString()}
-                    </span>
-                  </div>
-                </div>
-              ))}
-            </div>
-          </div>
-        </div>
-
-        {/* Main Content */}
-        <div className="flex-1 flex flex-col">
-          {/* Pair Selector */}
-          <div className="bg-gray-800 border-b border-gray-700 px-6 py-4">
-            <div className="flex items-center space-x-4">
-              <span className="text-sm font-medium text-gray-400">Trading Pair:</span>
-              <div className="flex space-x-2">
-                {['BTCUSDT', 'ETHUSDT', 'SOLUSDT'].map((pair) => (
+        {/* Main — chart */}
+        <main className="flex-1 flex flex-col overflow-hidden min-w-0">
+          <div className="flex-shrink-0 px-6 py-2.5 border-b border-slate-800/60 flex items-center gap-4">
+            <span className="text-[10px] uppercase tracking-wider text-slate-600">Pair</span>
+            <div className="flex items-center gap-1">
+              {['BTCUSDT', 'ETHUSDT', 'SOLUSDT'].map((pair) => {
+                const active = selectedPair === pair;
+                return (
                   <button
                     key={pair}
                     onClick={() => setSelectedPair(pair)}
-                    className={`px-4 py-2 rounded-lg text-sm font-medium transition-colors ${
-                      selectedPair === pair
-                        ? 'bg-blue-600 text-white'
-                        : 'bg-gray-700 text-gray-300 hover:bg-gray-600'
+                    className={`px-3 py-1 rounded-md text-xs font-mono transition-colors ${
+                      active
+                        ? 'bg-slate-800 text-white'
+                        : 'text-slate-500 hover:text-slate-300 hover:bg-slate-800/40'
                     }`}
                   >
                     {pair.replace('USDT', '/USDT')}
                   </button>
-                ))}
-              </div>
+                );
+              })}
             </div>
           </div>
 
-          {/* Charts and Data */}
-          <div className="flex-1 flex">
-            {/* Chart Area */}
-            <div className="flex-1 p-6">
-              <Chart 
-                symbol={selectedPair} 
-                isRunning={botStatus.isRunning}
-              />
+          <div className="flex-1 overflow-y-auto p-6">
+            <Chart
+              symbol={selectedPair}
+              isRunning={botStatus.isRunning}
+              onSymbolChange={setSelectedPair}
+            />
+          </div>
+        </main>
+
+        {/* Sidebar */}
+        <aside className="w-[340px] flex-shrink-0 border-l border-slate-800/60 flex flex-col overflow-hidden">
+
+          <section className="flex-1 flex flex-col overflow-hidden border-b border-slate-800/60 min-h-0">
+            <div className="flex-shrink-0 px-5 py-3.5 flex items-center justify-between">
+              <h3 className="text-[11px] font-medium text-slate-500 uppercase tracking-wider">
+                Open Positions
+              </h3>
+              <span className="text-[11px] font-mono text-slate-600">
+                {botStatus.positions.length}
+              </span>
             </div>
 
-            {/* Portfolio & History */}
-            <div className="w-96 border-l border-gray-700 flex flex-col">
-              <div className="flex-1 p-4">
-                <Portfolio 
-                  balance={balances}
-                  positions={botStatus.positions}
-                  stats={botStatus.stats}
-                />
-              </div>
-              
-              <div className="flex-1 p-4 border-t border-gray-700">
-                <TradeHistory trades={trades} />
-              </div>
+            <div className="flex-1 overflow-y-auto px-5 pb-4">
+              {botStatus.positions.length === 0 ? (
+                <p className="text-xs text-slate-600 py-6 text-center">No open positions</p>
+              ) : (
+                <div className="space-y-2">
+                  {botStatus.positions.map((p, i) => {
+                    const isLong = p.side === 'BUY';
+                    const up = (p.unrealizedPnL || 0) >= 0;
+                    return (
+                      <div key={i} className="rounded-md border border-slate-800/60 bg-slate-900/20 p-3">
+                        <div className="flex items-center justify-between mb-2">
+                          <span className="text-sm font-medium text-slate-200">{p.pair}</span>
+                          <span className={`text-[11px] font-medium ${
+                            isLong ? 'text-emerald-400' : 'text-rose-400'
+                          }`}>
+                            {p.side}
+                          </span>
+                        </div>
+                        <div className="grid grid-cols-2 gap-y-1 text-[11px]">
+                          <span className="text-slate-500">Entry</span>
+                          <span className="text-right font-mono text-slate-300">
+                            ${p.entryPrice?.toFixed(4)}
+                          </span>
+                          <span className="text-slate-500">Qty</span>
+                          <span className="text-right font-mono text-slate-300">
+                            {p.quantity?.toFixed(6)}
+                          </span>
+                          <span className="text-slate-500">Unrealized</span>
+                          <span className={`text-right font-mono font-medium ${
+                            up ? 'text-emerald-400' : 'text-rose-400'
+                          }`}>
+                            {up ? '+' : ''}{fmtMoney(p.unrealizedPnL || 0)}
+                          </span>
+                        </div>
+                      </div>
+                    );
+                  })}
+                </div>
+              )}
             </div>
-          </div>
-        </div>
+          </section>
+
+          <section className="flex-1 flex flex-col overflow-hidden min-h-0">
+            <div className="flex-shrink-0 px-5 py-3.5 flex items-center justify-between">
+              <h3 className="text-[11px] font-medium text-slate-500 uppercase tracking-wider">
+                Activity
+              </h3>
+              <span className="text-[11px] font-mono text-slate-600">
+                {statusMessages.length}
+              </span>
+            </div>
+
+            <div className="flex-1 overflow-y-auto px-5 pb-4">
+              {statusMessages.length === 0 ? (
+                <p className="text-xs text-slate-600 py-6 text-center">No activity yet</p>
+              ) : (
+                <ul className="space-y-1.5">
+                  {statusMessages.slice(0, 30).map((msg) => {
+                    const dot = {
+                      success: 'bg-emerald-500',
+                      error: 'bg-rose-500',
+                      warning: 'bg-amber-500',
+                      info: 'bg-slate-600'
+                    }[msg.type] || 'bg-slate-600';
+
+                    return (
+                      <li key={msg.id} className="flex items-start gap-2.5 py-1.5 text-xs">
+                        <span className={`mt-1.5 w-1 h-1 rounded-full flex-shrink-0 ${dot}`} />
+                        <span className="flex-1 text-slate-400 leading-snug">{msg.message}</span>
+                        <span className="text-[10px] font-mono text-slate-600 flex-shrink-0">
+                          {msg.timestamp.toLocaleTimeString([], {
+                            hour: '2-digit',
+                            minute: '2-digit'
+                          })}
+                        </span>
+                      </li>
+                    );
+                  })}
+                </ul>
+              )}
+            </div>
+          </section>
+        </aside>
       </div>
+    </div>
+  );
+};
+
+const Metric = ({ label, value, tone = 'neutral' }) => {
+  const toneClass = {
+    up: 'text-emerald-400',
+    down: 'text-rose-400',
+    neutral: 'text-white'
+  }[tone];
+
+  return (
+    <div className="px-6 py-3.5">
+      <div className="text-[10px] uppercase tracking-wider text-slate-600 mb-1">{label}</div>
+      <div className={`text-lg font-mono font-medium tracking-tight ${toneClass}`}>{value}</div>
     </div>
   );
 };

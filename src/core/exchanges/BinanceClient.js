@@ -1,531 +1,416 @@
-const crypto = require('crypto');
-const WebSocket = require('ws');
-const axios = require('axios');
+'use strict';
+
 const EventEmitter = require('events');
+const crypto       = require('crypto');
+const WebSocket    = require('ws');
 
 class BinanceClient extends EventEmitter {
-  constructor(apiKeys, settings = {}) {
+  constructor(config = {}) {
     super();
-    
-    this.apiKey = apiKeys?.apiKey;
-    this.apiSecret = apiKeys?.apiSecret;
-    this.isTestnet = settings.testnet || true; // Default to testnet for safety
-    
-    // API endpoints
-    this.baseURL = this.isTestnet 
-      ? 'https://testnet.binance.vision/api/v3'
-      : 'https://api.binance.com/api/v3';
-      
-    this.wsBaseURL = this.isTestnet
-      ? 'wss://testnet.binance.vision/ws'
-      : 'wss://stream.binance.com:9443/ws';
-    
-    this.wsStreams = new Map();
-    this.isConnected = false;
-    this.reconnectAttempts = 0;
-    this.maxReconnectAttempts = 5;
-    this.rateLimiter = new Map();
-    
-    // Request limits
-    this.requestWeight = 0;
-    this.requestLimit = 1200; // requests per minute
-    this.orderLimit = 10; // orders per second
-    this.lastOrderTime = 0;
-    
-    this.settings = {
-      enableStopLoss: settings.enableStopLoss !== false,
-      enableTakeProfit: settings.enableTakeProfit !== false,
-      maxRetries: 3,
-      retryDelay: 1000,
-      ...settings
-    };
+
+    this.testnet   = config.testnet ?? false;
+    this.apiKey    = config.apiKey || null;
+    this.apiSecret = config.apiSecret || null;
+    this.recvWindow = 5000;
+
+    // REST endpoints
+    this.restBase = this.testnet
+      ? 'https://testnet.binance.vision'
+      : 'https://api.binance.com';
+
+    // WS endpoints
+    this.wsBase = this.testnet
+      ? 'wss://stream.testnet.binance.vision'
+      : 'wss://stream.binance.com:9443';
+
+    this.fetchTimeout = 15000;
+
+    // WS state
+    this.ws = null;
+    this.wsReady = false;
+    this.wsReconnectTimer = null;
+    this.wsReconnectAttempts = 0;
+    this.maxWsReconnectAttempts = 10;
+    this.klineCallbacks = new Map();
+    this.symbolIntervals = new Map();
+
+    // Server-time offset (ms). Binance rejects requests >1000ms off.
+    this._timeOffset = 0;
+    this._timeSyncedAt = 0;
   }
 
-  async connect() {
+  /* ═══════════════════════════════════════════════════════════
+     SIGNING
+     ═══════════════════════════════════════════════════════════ */
+
+  /** Sync local clock with Binance server time. */
+  async _syncTime() {
+    // Only re-sync every 30 minutes
+    if (Date.now() - this._timeSyncedAt < 30 * 60 * 1000) return;
+
     try {
-      console.log(`Connecting to Binance ${this.isTestnet ? 'Testnet' : 'Mainnet'}...`);
-      
-      // Test API credentials
-      if (this.apiKey && this.apiSecret) {
-        await this.testConnectivity();
-        console.log('API credentials validated');
-      } else {
-        console.warn('No API credentials provided - read-only mode');
+      const r = await this._fetchPublic('/api/v3/time');
+      if (r?.serverTime) {
+        this._timeOffset = r.serverTime - Date.now();
+        this._timeSyncedAt = Date.now();
       }
-      
-      this.isConnected = true;
-      this.emit('connected');
-      
-    } catch (error) {
-      console.error('Failed to connect to Binance:', error);
-      throw new Error(`Binance connection failed: ${error.message}`);
+    } catch (err) {
+      console.warn('[Binance] Time sync failed:', err.message);
     }
   }
 
-  async disconnect() {
-    console.log('Disconnecting from Binance...');
-    
-    this.isConnected = false;
-    
-    // Close all WebSocket connections
-    this.wsStreams.forEach((ws, symbol) => {
-      if (ws.readyState === WebSocket.OPEN) {
-        ws.close();
-      }
-    });
-    this.wsStreams.clear();
-    
-    this.emit('disconnected');
+  _timestamp() {
+    return Date.now() + this._timeOffset;
   }
 
-  async testConnectivity() {
-    try {
-      // Test server time first
-      const serverTime = await this.getServerTime();
-      console.log('Server time sync successful');
-      
-      // Test account info if credentials are provided
-      if (this.apiKey && this.apiSecret) {
-        const account = await this.getAccountInfo();
-        console.log(`Account connected: ${account.accountType}`);
-        return account;
-      }
-      
-      return { status: 'connected', mode: 'read-only' };
-    } catch (error) {
-      throw new Error(`Connectivity test failed: ${error.message}`);
-    }
-  }
-
-  async getServerTime() {
-    const response = await this.makeRequest('/time');
-    return response.serverTime;
-  }
-
-  async getAccountInfo() {
-    if (!this.apiKey || !this.apiSecret) {
-      throw new Error('API credentials required for account info');
-    }
-    
-    return await this.makeSignedRequest('/account');
-  }
-
-  async getBalance(asset = 'USDT') {
-    try {
-      const account = await this.getAccountInfo();
-      const balance = account.balances.find(b => b.asset === asset);
-      return balance ? parseFloat(balance.free) : 0;
-    } catch (error) {
-      console.error(`Failed to get ${asset} balance:`, error);
-      return 0;
-    }
-  }
-
-  async getCurrentPrice(symbol) {
-    try {
-      const response = await this.makeRequest(`/ticker/price?symbol=${symbol}`);
-      return parseFloat(response.price);
-    } catch (error) {
-      console.error(`Failed to get price for ${symbol}:`, error);
-      throw error;
-    }
-  }
-
-  async getKlines(symbol, interval = '5m', limit = 100) {
-    try {
-      const params = `symbol=${symbol}&interval=${interval}&limit=${limit}`;
-      const response = await this.makeRequest(`/klines?${params}`);
-      
-      return response.map(kline => ({
-        openTime: kline[0],
-        open: parseFloat(kline[1]),
-        high: parseFloat(kline[2]),
-        low: parseFloat(kline[3]),
-        close: parseFloat(kline[4]),
-        volume: parseFloat(kline[5]),
-        closeTime: kline[6],
-        quoteVolume: parseFloat(kline[7]),
-        trades: kline[8],
-        baseAssetVolume: parseFloat(kline[9]),
-        quoteAssetVolume: parseFloat(kline[10])
-      }));
-    } catch (error) {
-      console.error(`Failed to get klines for ${symbol}:`, error);
-      throw error;
-    }
-  }
-
-  async createMarketOrder(orderParams) {
-    if (!this.apiKey || !this.apiSecret) {
-      throw new Error('API credentials required for trading');
-    }
-
-    try {
-      const { symbol, side, quantity, type = 'MARKET' } = orderParams;
-      
-      // Validate order parameters
-      this.validateOrderParams(orderParams);
-      
-      // Rate limiting check
-      await this.checkRateLimit();
-      
-      const params = {
-        symbol,
-        side,
-        type,
-        quantity: this.formatQuantity(quantity),
-        timestamp: Date.now()
-      };
-
-      console.log(`Creating ${side} order for ${symbol}: ${quantity} @ MARKET`);
-      
-      const order = await this.makeSignedRequest('/order', 'POST', params);
-      
-      console.log(`Order executed: ${order.orderId} - Status: ${order.status}`);
-      
-      return {
-        orderId: order.orderId,
-        symbol: order.symbol,
-        side: order.side,
-        type: order.type,
-        quantity: order.origQty,
-        executedQty: order.executedQty,
-        price: order.fills?.[0]?.price || order.price,
-        status: order.status,
-        timestamp: new Date()
-      };
-      
-    } catch (error) {
-      console.error('Failed to create market order:', error);
-      throw new Error(`Order creation failed: ${error.message}`);
-    }
-  }
-
-  async createStopOrder(orderParams) {
-    if (!this.settings.enableStopLoss) {
-      console.log('Stop orders disabled in settings');
-      return null;
-    }
-
-    try {
-      const { symbol, side, quantity, stopPrice, type = 'STOP_MARKET' } = orderParams;
-      
-      await this.checkRateLimit();
-      
-      const params = {
-        symbol,
-        side,
-        type,
-        quantity: this.formatQuantity(quantity),
-        stopPrice: this.formatPrice(stopPrice),
-        timestamp: Date.now()
-      };
-
-      console.log(`Creating stop order for ${symbol}: ${quantity} @ ${stopPrice}`);
-      
-      const order = await this.makeSignedRequest('/order', 'POST', params);
-      
-      return {
-        orderId: order.orderId,
-        symbol: order.symbol,
-        side: order.side,
-        type: order.type,
-        quantity: order.origQty,
-        stopPrice: order.stopPrice,
-        status: order.status,
-        timestamp: new Date()
-      };
-      
-    } catch (error) {
-      console.error('Failed to create stop order:', error);
-      throw error;
-    }
-  }
-
-  async createLimitOrder(orderParams) {
-    try {
-      const { symbol, side, quantity, price, type = 'LIMIT', timeInForce = 'GTC' } = orderParams;
-      
-      await this.checkRateLimit();
-      
-      const params = {
-        symbol,
-        side,
-        type,
-        quantity: this.formatQuantity(quantity),
-        price: this.formatPrice(price),
-        timeInForce,
-        timestamp: Date.now()
-      };
-
-      const order = await this.makeSignedRequest('/order', 'POST', params);
-      
-      return {
-        orderId: order.orderId,
-        symbol: order.symbol,
-        side: order.side,
-        type: order.type,
-        quantity: order.origQty,
-        price: order.price,
-        status: order.status,
-        timestamp: new Date()
-      };
-      
-    } catch (error) {
-      console.error('Failed to create limit order:', error);
-      throw error;
-    }
-  }
-
-  async cancelOrder(symbol, orderId) {
-    try {
-      const params = {
-        symbol,
-        orderId,
-        timestamp: Date.now()
-      };
-
-      const result = await this.makeSignedRequest('/order', 'DELETE', params);
-      console.log(`Order cancelled: ${orderId}`);
-      
-      return result;
-    } catch (error) {
-      console.error('Failed to cancel order:', error);
-      throw error;
-    }
-  }
-
-  async getOpenOrders(symbol = null) {
-    try {
-      const params = {
-        timestamp: Date.now()
-      };
-      
-      if (symbol) {
-        params.symbol = symbol;
-      }
-
-      return await this.makeSignedRequest('/openOrders', 'GET', params);
-    } catch (error) {
-      console.error('Failed to get open orders:', error);
-      throw error;
-    }
-  }
-
-  async get24hrStats(symbol) {
-    try {
-      const response = await this.makeRequest(`/ticker/24hr?symbol=${symbol}`);
-      return {
-        symbol: response.symbol,
-        priceChange: parseFloat(response.priceChange),
-        priceChangePercent: parseFloat(response.priceChangePercent),
-        volume: parseFloat(response.volume),
-        high: parseFloat(response.highPrice),
-        low: parseFloat(response.lowPrice),
-        open: parseFloat(response.openPrice),
-        close: parseFloat(response.lastPrice)
-      };
-    } catch (error) {
-      console.error(`Failed to get 24hr stats for ${symbol}:`, error);
-      throw error;
-    }
-  }
-
-  // WebSocket methods
-  subscribeToTicker(symbol, callback) {
-    const stream = `${symbol.toLowerCase()}@ticker`;
-    const ws = new WebSocket(`${this.wsBaseURL}/${stream}`);
-    
-    ws.on('message', (data) => {
-      try {
-        const ticker = JSON.parse(data);
-        callback({
-          symbol: ticker.s,
-          price: parseFloat(ticker.c),
-          change: parseFloat(ticker.P),
-          volume: parseFloat(ticker.v),
-          high: parseFloat(ticker.h),
-          low: parseFloat(ticker.l)
-        });
-      } catch (error) {
-        console.error('Error parsing ticker data:', error);
-      }
-    });
-
-    ws.on('error', (error) => {
-      console.error(`WebSocket error for ${symbol}:`, error);
-    });
-
-    this.wsStreams.set(symbol, ws);
-    return ws;
-  }
-
-  subscribeToKlines(symbol, interval, callback) {
-    const stream = `${symbol.toLowerCase()}@kline_${interval}`;
-    const ws = new WebSocket(`${this.wsBaseURL}/${stream}`);
-    
-    ws.on('message', (data) => {
-      try {
-        const klineData = JSON.parse(data);
-        const kline = klineData.k;
-        
-        if (kline.x) { // Only completed klines
-          callback({
-            symbol: kline.s,
-            openTime: kline.t,
-            closeTime: kline.T,
-            open: parseFloat(kline.o),
-            high: parseFloat(kline.h),
-            low: parseFloat(kline.l),
-            close: parseFloat(kline.c),
-            volume: parseFloat(kline.v)
-          });
-        }
-      } catch (error) {
-        console.error('Error parsing kline data:', error);
-      }
-    });
-
-    this.wsStreams.set(`${symbol}_klines`, ws);
-    return ws;
-  }
-
-  // Utility methods
-  async makeRequest(endpoint, retries = 0) {
-    try {
-      const url = `${this.baseURL}${endpoint}`;
-      const response = await axios.get(url, {
-        timeout: 10000,
-        headers: {
-          'X-MBX-APIKEY': this.apiKey
-        }
-      });
-      
-      this.updateRequestWeight(response.headers);
-      return response.data;
-      
-    } catch (error) {
-      if (retries < this.settings.maxRetries && this.shouldRetry(error)) {
-        console.log(`Retrying request (${retries + 1}/${this.settings.maxRetries})...`);
-        await this.delay(this.settings.retryDelay * Math.pow(2, retries));
-        return this.makeRequest(endpoint, retries + 1);
-      }
-      
-      throw this.handleError(error);
-    }
-  }
-
-  async makeSignedRequest(endpoint, method = 'GET', params = {}, retries = 0) {
-    try {
-      params.timestamp = Date.now();
-      const queryString = this.buildQueryString(params);
-      const signature = this.createSignature(queryString);
-      
-      const config = {
-        method,
-        url: `${this.baseURL}${endpoint}`,
-        timeout: 10000,
-        headers: {
-          'X-MBX-APIKEY': this.apiKey
-        }
-      };
-
-      if (method === 'GET' || method === 'DELETE') {
-        config.url += `?${queryString}&signature=${signature}`;
-      } else {
-        config.data = `${queryString}&signature=${signature}`;
-        config.headers['Content-Type'] = 'application/x-www-form-urlencoded';
-      }
-
-      const response = await axios(config);
-      this.updateRequestWeight(response.headers);
-      
-      return response.data;
-      
-    } catch (error) {
-      if (retries < this.settings.maxRetries && this.shouldRetry(error)) {
-        await this.delay(this.settings.retryDelay * Math.pow(2, retries));
-        return this.makeSignedRequest(endpoint, method, params, retries + 1);
-      }
-      
-      throw this.handleError(error);
-    }
-  }
-
-  createSignature(queryString) {
+  _sign(queryString) {
     return crypto
       .createHmac('sha256', this.apiSecret)
       .update(queryString)
       .digest('hex');
   }
 
-  buildQueryString(params) {
-    return Object.keys(params)
-      .map(key => `${key}=${encodeURIComponent(params[key])}`)
-      .join('&');
+  _requireKeys() {
+    if (!this.apiKey || !this.apiSecret) {
+      throw new Error('Binance API keys not configured');
+    }
   }
 
-  validateOrderParams({ symbol, side, quantity }) {
+  /* ═══════════════════════════════════════════════════════════
+     HTTP HELPERS
+     ═══════════════════════════════════════════════════════════ */
+
+  async _fetchPublic(path) {
+    const controller = new AbortController();
+    const timer = setTimeout(() => controller.abort(), this.fetchTimeout);
+    try {
+      const r = await fetch(`${this.restBase}${path}`, { signal: controller.signal });
+      if (!r.ok) {
+        const text = await r.text().catch(() => '');
+        throw new Error(`Binance REST ${r.status}: ${text.slice(0, 200)}`);
+      }
+      return r.json();
+    } finally {
+      clearTimeout(timer);
+    }
+  }
+
+  async _fetchSigned(method, path, params = {}) {
+    this._requireKeys();
+    await this._syncTime();
+
+    const signed = {
+      ...params,
+      timestamp: this._timestamp(),
+      recvWindow: this.recvWindow
+    };
+    const query = new URLSearchParams(signed).toString();
+    const signature = this._sign(query);
+    const url = `${this.restBase}${path}?${query}&signature=${signature}`;
+
+    const controller = new AbortController();
+    const timer = setTimeout(() => controller.abort(), this.fetchTimeout);
+    try {
+      const r = await fetch(url, {
+        method,
+        headers: {
+          'X-MBX-APIKEY': this.apiKey
+        },
+        signal: controller.signal
+      });
+      const text = await r.text();
+      let data;
+      try { data = JSON.parse(text); } catch { data = { raw: text }; }
+
+      if (!r.ok) {
+        // Binance returns { code, msg }
+        const msg = data?.msg || data?.raw || `HTTP ${r.status}`;
+        const code = data?.code;
+        throw new Error(`Binance ${r.status}${code ? ` [${code}]` : ''}: ${msg}`);
+      }
+      return data;
+    } finally {
+      clearTimeout(timer);
+    }
+  }
+
+  /* ═══════════════════════════════════════════════════════════
+     PUBLIC API — account info
+     ═══════════════════════════════════════════════════════════ */
+
+  async getAccountInfo() {
+    return this._fetchSigned('GET', '/api/v3/account');
+  }
+
+  /** Get balance for one asset (e.g. 'USDT'). Returns free amount as Number. */
+  async getBalance(asset = 'USDT') {
+    const info = await this.getAccountInfo();
+    const bal = (info.balances || []).find(
+      (b) => b.asset.toUpperCase() === asset.toUpperCase()
+    );
+    return bal ? parseFloat(bal.free) : 0;
+  }
+
+  /** Get all non-zero balances. */
+  async getAllBalances() {
+    const info = await this.getAccountInfo();
+    return (info.balances || [])
+      .filter((b) => parseFloat(b.free) > 0 || parseFloat(b.locked) > 0)
+      .map((b) => ({
+        asset:  b.asset,
+        free:   parseFloat(b.free),
+        locked: parseFloat(b.locked)
+      }));
+  }
+
+  /* ═══════════════════════════════════════════════════════════
+     PUBLIC API — market data
+     ═══════════════════════════════════════════════════════════ */
+
+  async getTickerPrice(symbol) {
+    return this._fetchPublic(`/api/v3/ticker/price?symbol=${encodeURIComponent(symbol)}`);
+  }
+
+  async getKlines(symbol, interval = '5m', limit = 200) {
+    const url = `/api/v3/klines?symbol=${encodeURIComponent(symbol)}` +
+                `&interval=${interval}&limit=${Math.min(limit, 1000)}`;
+    const raw = await this._fetchPublic(url);
+    if (!Array.isArray(raw)) throw new Error('Binance klines: unexpected shape');
+    return raw.map((c) => ({
+      openTime:  c[0],
+      open:      c[1],
+      high:      c[2],
+      low:       c[3],
+      close:     c[4],
+      volume:    c[5],
+      closeTime: c[6]
+    }));
+  }
+
+  async getExchangeInfo(symbol = null) {
+    const path = symbol
+      ? `/api/v3/exchangeInfo?symbol=${encodeURIComponent(symbol)}`
+      : '/api/v3/exchangeInfo';
+    return this._fetchPublic(path);
+  }
+
+  /* ═══════════════════════════════════════════════════════════
+     TEST CONNECTION
+     ═══════════════════════════════════════════════════════════ */
+
+  async testConnection() {
+    try {
+      // 1. Public API reachable?
+      const price = await this.getTickerPrice('BTCUSDT');
+      const priceNum = parseFloat(price?.price || 0);
+
+      // 2. Authenticated API reachable?
+      if (this.apiKey && this.apiSecret) {
+        await this.getAccountInfo();
+        return {
+          success: true,
+          price: priceNum,
+          authenticated: true,
+          testnet: this.testnet
+        };
+      }
+
+      return {
+        success: true,
+        price: priceNum,
+        authenticated: false,
+        testnet: this.testnet,
+        warning: 'Public endpoints only — no API keys'
+      };
+    } catch (err) {
+      // Common errors — translate to friendly messages
+      let message = err.message;
+      if (/Invalid API-key/i.test(message)) message = 'Invalid API key — check for typos';
+      if (/Signature/i.test(message))          message = 'Invalid signature — secret may be wrong';
+      if (/IP/i.test(message))                 message = 'Your IP is not whitelisted on Binance';
+      if (/Timestamp/i.test(message))          message = 'Clock skew — try again';
+      return { success: false, error: message };
+    }
+  }
+
+  /* ═══════════════════════════════════════════════════════════
+     ORDER PLACEMENT
+     ═══════════════════════════════════════════════════════════ */
+
+  /**
+   * Place an order. Matches the shape expected by TradingBot:
+   *   createMarketOrder({ symbol, side, quantity, type })
+   */
+  async createMarketOrder(order) {
+    const { symbol, side, quantity, type = 'MARKET' } = order;
+
     if (!symbol || !side || !quantity) {
-      throw new Error('Missing required order parameters');
+      throw new Error('createMarketOrder: symbol, side, quantity required');
     }
-    
-    if (!['BUY', 'SELL'].includes(side)) {
-      throw new Error('Invalid order side');
-    }
-    
-    if (quantity <= 0) {
-      throw new Error('Invalid quantity');
+
+    // Binance requires quantity precision to match the symbol's LOT_SIZE step
+    const qty = await this._roundToStepSize(symbol, quantity);
+
+    const params = {
+      symbol,
+      side:     String(side).toUpperCase(),   // BUY or SELL
+      type:     String(type).toUpperCase(),
+      quantity: qty
+    };
+
+    const res = await this._fetchSigned('POST', '/api/v3/order', params);
+
+    // Normalize to TradingBot's expected response
+    return {
+      orderId:     res.orderId,
+      clientOrderId: res.clientOrderId,
+      symbol:      res.symbol,
+      side:        res.side,
+      type:        res.type,
+      status:      res.status,
+      price:       res.fills?.[0] ? parseFloat(res.fills[0].price) : null,
+      executedQty: parseFloat(res.executedQty || qty),
+      cummulativeQuoteQty: parseFloat(res.cummulativeQuoteQty || 0),
+      fills:       res.fills || []
+    };
+  }
+
+  /**
+   * Round quantity DOWN to the symbol's stepSize.
+   * Binance rejects orders that don't align with LOT_SIZE.
+   */
+  async _roundToStepSize(symbol, quantity) {
+    try {
+      const info = await this.getExchangeInfo(symbol);
+      const filter = info?.symbols?.[0]?.filters?.find(
+        (f) => f.filterType === 'LOT_SIZE'
+      );
+      if (!filter) return quantity;
+
+      const stepSize = parseFloat(filter.stepSize);
+      if (!stepSize || stepSize <= 0) return quantity;
+
+      const precision = Math.round(-Math.log10(stepSize));
+      const rounded = Math.floor(quantity / stepSize) * stepSize;
+
+      return parseFloat(rounded.toFixed(precision));
+    } catch (err) {
+      console.warn('[Binance] stepSize lookup failed:', err.message);
+      // Fallback: 6 decimals — safe for BTC/ETH
+      return parseFloat(quantity.toFixed(6));
     }
   }
 
-  async checkRateLimit() {
-    const now = Date.now();
-    
-    // Order rate limit (10/second)
-    if (now - this.lastOrderTime < 100) {
-      await this.delay(100 - (now - this.lastOrderTime));
+  /* ═══════════════════════════════════════════════════════════
+     WEBSOCKET — real-time klines (only CLOSED candles emitted)
+     ═══════════════════════════════════════════════════════════ */
+
+  async subscribeTicker(symbol, callback, options = {}) {
+    const interval = options.interval || '5m';
+    const sym = symbol.toUpperCase();
+
+    if (!this.klineCallbacks.has(sym)) this.klineCallbacks.set(sym, new Set());
+    this.klineCallbacks.get(sym).add(callback);
+    this.symbolIntervals.set(sym, interval);
+
+    await this._rebuildWebSocket();
+    return true;
+  }
+
+  async unsubscribeTicker(symbol) {
+    const sym = symbol.toUpperCase();
+    this.klineCallbacks.delete(sym);
+    this.symbolIntervals.delete(sym);
+    await this._rebuildWebSocket();
+  }
+
+  async _rebuildWebSocket() {
+    if (this.ws) {
+      this.ws.removeAllListeners();
+      try { this.ws.close(); } catch {}
+      this.ws = null;
     }
-    this.lastOrderTime = Date.now();
-    
-    // Request weight limit
-    if (this.requestWeight > this.requestLimit * 0.9) {
-      console.log('Approaching rate limit, waiting...');
-      await this.delay(60000); // Wait 1 minute
-      this.requestWeight = 0;
+    if (this.wsReconnectTimer) {
+      clearTimeout(this.wsReconnectTimer);
+      this.wsReconnectTimer = null;
     }
-  }
+    if (this.klineCallbacks.size === 0) return;
 
-  updateRequestWeight(headers) {
-    if (headers['x-mbx-used-weight-1m']) {
-      this.requestWeight = parseInt(headers['x-mbx-used-weight-1m']);
+    const streams = [];
+    for (const [sym, interval] of this.symbolIntervals.entries()) {
+      streams.push(`${sym.toLowerCase()}@kline_${interval}`);
     }
+    const url = `${this.wsBase}/stream?streams=${streams.join('/')}`;
+
+    console.log(`[Binance] WS connecting (${streams.length} streams)`);
+    this.ws = new WebSocket(url);
+
+    this.ws.on('open', () => {
+      this.wsReady = true;
+      this.wsReconnectAttempts = 0;
+      console.log('[Binance] WS connected');
+    });
+
+    this.ws.on('message', (buf) => {
+      let msg;
+      try { msg = JSON.parse(buf.toString()); } catch { return; }
+      const p = msg.data ?? msg;
+      if (p?.e !== 'kline') return;
+      const k = p.k;
+      if (!k?.x) return; // not closed
+
+      const candle = {
+        symbol:    p.s,
+        openTime:  k.t,
+        closeTime: k.T,
+        open:      parseFloat(k.o),
+        high:      parseFloat(k.h),
+        low:       parseFloat(k.l),
+        close:     parseFloat(k.c),
+        volume:    parseFloat(k.v),
+        interval:  k.i,
+        closed:    true
+      };
+
+      const cbs = this.klineCallbacks.get(p.s);
+      if (cbs) cbs.forEach((cb) => {
+        try { cb(candle); } catch (e) { console.error('[Binance] cb error:', e); }
+      });
+    });
+
+    this.ws.on('error', (err) => {
+      console.error('[Binance] WS error:', err.message);
+    });
+
+    this.ws.on('close', () => {
+      this.wsReady = false;
+      this._scheduleWsReconnect();
+    });
   }
 
-  shouldRetry(error) {
-    if (!error.response) return true; // Network errors
-    
-    const status = error.response.status;
-    return status === 429 || status >= 500; // Rate limit or server errors
+  _scheduleWsReconnect() {
+    if (this.klineCallbacks.size === 0) return;
+    if (this.wsReconnectAttempts >= this.maxWsReconnectAttempts) return;
+
+    this.wsReconnectAttempts++;
+    const delay = Math.min(1000 * 2 ** (this.wsReconnectAttempts - 1), 30000);
+    this.wsReconnectTimer = setTimeout(() => this._rebuildWebSocket(), delay);
   }
 
-  handleError(error) {
-    if (error.response?.data?.msg) {
-      return new Error(`Binance API Error: ${error.response.data.msg}`);
+  /* ═══════════════════════════════════════════════════════════
+     LIFECYCLE
+     ═══════════════════════════════════════════════════════════ */
+
+  async shutdown() {
+    if (this.wsReconnectTimer) clearTimeout(this.wsReconnectTimer);
+    if (this.ws) {
+      this.ws.removeAllListeners();
+      try { this.ws.close(); } catch {}
+      this.ws = null;
     }
-    return error;
-  }
-
-  formatQuantity(quantity) {
-    return parseFloat(quantity).toFixed(8).replace(/\.?0+$/, '');
-  }
-
-  formatPrice(price) {
-    return parseFloat(price).toFixed(8).replace(/\.?0+$/, '');
-  }
-
-  delay(ms) {
-    return new Promise(resolve => setTimeout(resolve, ms));
+    this.klineCallbacks.clear();
+    this.symbolIntervals.clear();
+    this.wsReady = false;
   }
 }
 

@@ -1,176 +1,279 @@
-const crypto = require('crypto');
-const https = require('https');
+'use strict';
 
-class BaseExchange {
-  constructor(name, config = {}) {
-    this.name = name;
-    this.apiKey = config.apiKey;
-    this.apiSecret = config.apiSecret;
-    this.testnet = config.testnet || false;
-    this.baseUrl = config.baseUrl;
-    this.rateLimit = config.rateLimit || 1200; // requests per minute
-    this.lastRequestTime = 0;
+const EventEmitter = require('events');
+const WebSocket = require('ws');
+
+class BinanceClient extends EventEmitter {
+  constructor(config = {}) {
+    super();
+
+    this.testnet = config.testnet ?? false;
+    this.apiKey = config.apiKey ?? null;
+    this.apiSecret = config.apiSecret ?? null;
+
+    // Public REST + WS endpoints
+    this.restBase = this.testnet
+      ? 'https://testnet.binance.vision'
+      : 'https://api.binance.com';
+    this.wsBase = this.testnet
+      ? 'wss://stream.testnet.binance.vision'
+      : 'wss://stream.binance.com:9443';
+
+    // WS state
+    this.ws = null;
+    this.wsReady = false;
+    this.wsReconnectTimer = null;
+    this.wsReconnectAttempts = 0;
+    this.maxWsReconnectAttempts = 10;
+
+    // Subscriptions: symbol -> Set<callback>
+    this.klineCallbacks = new Map();
+    // symbol -> interval (current timeframe for that symbol)
+    this.symbolIntervals = new Map();
+
+    // HTTP timeout for fetch
+    this.fetchTimeout = 15000;
   }
 
-  // Abstract methods to be implemented by subclasses
-  async getBalance() {
-    throw new Error('getBalance() method must be implemented by subclass');
-  }
+  /* ═══════════════════════════════════════════════════════════════
+     REST — historical klines
+     ═══════════════════════════════════════════════════════════════ */
 
-  async getCurrentPrice(symbol) {
-    throw new Error('getCurrentPrice() method must be implemented by subclass');
-  }
+  async getKlines(symbol, interval = '5m', limit = 200) {
+    const url =
+      `${this.restBase}/api/v3/klines` +
+      `?symbol=${encodeURIComponent(symbol)}` +
+      `&interval=${encodeURIComponent(interval)}` +
+      `&limit=${Math.min(limit, 1000)}`;
 
-  async placeBuyOrder(symbol, quantity, price = null) {
-    throw new Error('placeBuyOrder() method must be implemented by subclass');
-  }
+    const controller = new AbortController();
+    const timer = setTimeout(() => controller.abort(), this.fetchTimeout);
 
-  async placeSellOrder(symbol, quantity, price = null) {
-    throw new Error('placeSellOrder() method must be implemented by subclass');
-  }
-
-  async getOpenOrders(symbol = null) {
-    throw new Error('getOpenOrders() method must be implemented by subclass');
-  }
-
-  async cancelOrder(orderId, symbol) {
-    throw new Error('cancelOrder() method must be implemented by subclass');
-  }
-
-  async getOrderHistory(symbol = null, limit = 100) {
-    throw new Error('getOrderHistory() method must be implemented by subclass');
-  }
-
-  // Common utility methods
-  async enforceRateLimit() {
-    const now = Date.now();
-    const timeSinceLastRequest = now - this.lastRequestTime;
-    const minInterval = (60 * 1000) / this.rateLimit; // ms between requests
-    
-    if (timeSinceLastRequest < minInterval) {
-      const delay = minInterval - timeSinceLastRequest;
-      await new Promise(resolve => setTimeout(resolve, delay));
-    }
-    
-    this.lastRequestTime = Date.now();
-  }
-
-  createSignature(query, secret, algorithm = 'sha256') {
-    return crypto.createHmac(algorithm, secret).update(query).digest('hex');
-  }
-
-  async makeRequest(method, endpoint, params = {}, signed = false) {
-    await this.enforceRateLimit();
-
-    const url = new URL(endpoint, this.baseUrl);
-    const headers = {
-      'Content-Type': 'application/json',
-      'X-MBX-APIKEY': this.apiKey
-    };
-
-    if (signed) {
-      params.timestamp = Date.now();
-      const queryString = new URLSearchParams(params).toString();
-      params.signature = this.createSignature(queryString, this.apiSecret);
-    }
-
-    if (method === 'GET' && Object.keys(params).length > 0) {
-      Object.keys(params).forEach(key => {
-        url.searchParams.append(key, params[key]);
-      });
-    }
-
-    const options = {
-      method,
-      headers
-    };
-
-    if (method !== 'GET' && Object.keys(params).length > 0) {
-      options.body = JSON.stringify(params);
-    }
-
+    let res;
     try {
-      const response = await this.httpRequest(url.toString(), options);
-      return JSON.parse(response);
-    } catch (error) {
-      console.error(`${this.name} API Error:`, error);
-      throw error;
+      res = await fetch(url, { signal: controller.signal });
+    } catch (err) {
+      throw new Error(`Binance REST unreachable: ${err.message}`);
+    } finally {
+      clearTimeout(timer);
+    }
+
+    if (!res.ok) {
+      const text = await res.text().catch(() => '');
+      throw new Error(`Binance REST ${res.status}: ${text.slice(0, 200)}`);
+    }
+
+    const raw = await res.json();
+    if (!Array.isArray(raw)) {
+      throw new Error('Binance REST: unexpected response shape');
+    }
+
+    // Map Binance's array-of-arrays to named fields
+    return raw.map((c) => ({
+      openTime:  c[0],
+      open:      c[1],
+      high:      c[2],
+      low:       c[3],
+      close:     c[4],
+      volume:    c[5],
+      closeTime: c[6],
+      quoteVolume: c[7],
+      trades:    c[8]
+    }));
+  }
+
+  /* ═══════════════════════════════════════════════════════════════
+     REST — 24h ticker (for exchange test / status)
+     ═══════════════════════════════════════════════════════════════ */
+
+  async getTickerPrice(symbol) {
+    const url = `${this.restBase}/api/v3/ticker/price?symbol=${encodeURIComponent(symbol)}`;
+    const res = await fetch(url);
+    if (!res.ok) throw new Error(`Binance ticker ${res.status}`);
+    return res.json();
+  }
+
+  async testConnection() {
+    try {
+      const r = await this.getTickerPrice('BTCUSDT');
+      return { success: true, price: parseFloat(r.price) };
+    } catch (err) {
+      return { success: false, error: err.message };
     }
   }
 
-  httpRequest(url, options) {
-    return new Promise((resolve, reject) => {
-      const req = https.request(url, options, (res) => {
-        let data = '';
-        res.on('data', chunk => data += chunk);
-        res.on('end', () => {
-          if (res.statusCode >= 200 && res.statusCode < 300) {
-            resolve(data);
-          } else {
-            reject(new Error(`HTTP ${res.statusCode}: ${data}`));
-          }
-        });
-      });
+  /* ═══════════════════════════════════════════════════════════════
+     WebSocket — kline stream
+     subscribeTicker(symbol, cb, { interval }) — cb fires on CLOSED candle only
+     ═══════════════════════════════════════════════════════════════ */
 
-      req.on('error', reject);
-      
-      if (options.body) {
-        req.write(options.body);
-      }
-      
-      req.end();
+  async subscribeTicker(symbol, callback, options = {}) {
+    const interval = options.interval || '5m';
+    const sym = symbol.toUpperCase();
+
+    // Register callback
+    if (!this.klineCallbacks.has(sym)) {
+      this.klineCallbacks.set(sym, new Set());
+    }
+    this.klineCallbacks.get(sym).add(callback);
+
+    // Track interval for this symbol
+    this.symbolIntervals.set(sym, interval);
+
+    // (Re)build the WebSocket with the new subscription set
+    await this._rebuildWebSocket();
+
+    return true;
+  }
+
+  async unsubscribeTicker(symbol) {
+    const sym = symbol.toUpperCase();
+    this.klineCallbacks.delete(sym);
+    this.symbolIntervals.delete(sym);
+    await this._rebuildWebSocket();
+  }
+
+  /* ═══════════════════════════════════════════════════════════════
+     WS internals
+     ═══════════════════════════════════════════════════════════════ */
+
+  async _rebuildWebSocket() {
+    // Close existing
+    if (this.ws) {
+      this.ws.removeAllListeners();
+      try { this.ws.close(); } catch {}
+      this.ws = null;
+    }
+    if (this.wsReconnectTimer) {
+      clearTimeout(this.wsReconnectTimer);
+      this.wsReconnectTimer = null;
+    }
+
+    // Nothing to subscribe to
+    if (this.klineCallbacks.size === 0) return;
+
+    // Build combined stream URL
+    // Example: /stream?streams=btcusdt@kline_5m/ethusdt@kline_5m
+    const streams = [];
+    for (const [sym, interval] of this.symbolIntervals.entries()) {
+      streams.push(`${sym.toLowerCase()}@kline_${interval}`);
+    }
+    const url = `${this.wsBase}/stream?streams=${streams.join('/')}`;
+
+    console.log(`[BinanceClient] Connecting WS (${streams.length} streams)…`);
+
+    this.ws = new WebSocket(url);
+
+    this.ws.on('open', () => {
+      console.log('[BinanceClient] WS connected');
+      this.wsReady = true;
+      this.wsReconnectAttempts = 0;
+      this.emit('ws-open');
+    });
+
+    this.ws.on('message', (buf) => this._handleWsMessage(buf));
+
+    this.ws.on('ping', () => {
+      // Respond with pong (ws lib usually does this automatically)
+      try { this.ws.pong(); } catch {}
+    });
+
+    this.ws.on('error', (err) => {
+      console.error('[BinanceClient] WS error:', err.message);
+      this.emit('ws-error', err);
+    });
+
+    this.ws.on('close', (code, reason) => {
+      this.wsReady = false;
+      console.warn(`[BinanceClient] WS closed (${code} ${reason || ''})`);
+      this.emit('ws-close', { code, reason: reason?.toString() });
+      this._scheduleWsReconnect();
     });
   }
 
-  // Validation methods
-  validateSymbol(symbol) {
-    if (!symbol || typeof symbol !== 'string') {
-      throw new Error('Invalid symbol provided');
+  _scheduleWsReconnect() {
+    if (this.klineCallbacks.size === 0) return; // nothing to reconnect for
+    if (this.wsReconnectAttempts >= this.maxWsReconnectAttempts) {
+      console.error('[BinanceClient] Max WS reconnect attempts reached');
+      this.emit('ws-give-up');
+      return;
     }
-    return symbol.toUpperCase();
+
+    this.wsReconnectAttempts++;
+    // Exponential backoff: 1s, 2s, 4s, 8s … capped at 30s
+    const delay = Math.min(1000 * 2 ** (this.wsReconnectAttempts - 1), 30000);
+
+    console.log(`[BinanceClient] Reconnecting in ${delay}ms (attempt ${this.wsReconnectAttempts})`);
+    this.wsReconnectTimer = setTimeout(() => this._rebuildWebSocket(), delay);
   }
 
-  validateQuantity(quantity) {
-    const num = parseFloat(quantity);
-    if (isNaN(num) || num <= 0) {
-      throw new Error('Invalid quantity provided');
-    }
-    return num;
-  }
-
-  validatePrice(price) {
-    if (price === null || price === undefined) return null;
-    const num = parseFloat(price);
-    if (isNaN(num) || num <= 0) {
-      throw new Error('Invalid price provided');
-    }
-    return num;
-  }
-
-  // Test connection
-  async testConnection() {
+  _handleWsMessage(buf) {
+    let msg;
     try {
-      await this.getBalance();
-      return { success: true, message: 'Connection successful' };
-    } catch (error) {
-      return { success: false, error: error.message };
+      msg = JSON.parse(buf.toString());
+    } catch {
+      return;
+    }
+
+    // Combined stream format: { stream, data }
+    const payload = msg.data ?? msg;
+    if (!payload?.e) return;
+
+    if (payload.e === 'kline') {
+      const k = payload.k;
+      const symbol = payload.s;
+
+      // Only emit when the candle is CLOSED
+      if (!k.x) return;
+
+      const candle = {
+        symbol,
+        openTime:  k.t,
+        closeTime: k.T,
+        open:      parseFloat(k.o),
+        high:      parseFloat(k.h),
+        low:       parseFloat(k.l),
+        close:     parseFloat(k.c),
+        volume:    parseFloat(k.v),
+        quoteVolume: parseFloat(k.q),
+        trades:    k.n,
+        interval:  k.i,
+        closed:    k.x
+      };
+
+      // Notify all callbacks for this symbol
+      const callbacks = this.klineCallbacks.get(symbol);
+      if (callbacks) {
+        for (const cb of callbacks) {
+          try { cb(candle); }
+          catch (err) {
+            console.error(`[BinanceClient] callback error for ${symbol}:`, err);
+          }
+        }
+      }
+
+      this.emit('kline', candle);
     }
   }
 
-  // Format order response
-  formatOrderResponse(orderData) {
-    return {
-      orderId: orderData.orderId,
-      symbol: orderData.symbol,
-      side: orderData.side.toLowerCase(),
-      quantity: parseFloat(orderData.origQty),
-      price: parseFloat(orderData.price),
-      status: orderData.status.toLowerCase(),
-      timestamp: new Date(orderData.time || orderData.transactTime),
-      executedQty: parseFloat(orderData.executedQty || 0),
-      success: true
-    };
+  /* ═══════════════════════════════════════════════════════════════
+     Lifecycle
+     ═══════════════════════════════════════════════════════════════ */
+
+  async shutdown() {
+    if (this.wsReconnectTimer) {
+      clearTimeout(this.wsReconnectTimer);
+      this.wsReconnectTimer = null;
+    }
+    if (this.ws) {
+      this.ws.removeAllListeners();
+      try { this.ws.close(); } catch {}
+      this.ws = null;
+    }
+    this.klineCallbacks.clear();
+    this.symbolIntervals.clear();
+    this.wsReady = false;
   }
 }
 
-module.exports = BaseExchange;export default Backtesting;
+module.exports = BinanceClient;
